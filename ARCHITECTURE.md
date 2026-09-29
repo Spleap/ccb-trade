@@ -56,7 +56,8 @@
                         │
                         ▼
 路由层          router.py —— 方法 → 类别 → 厂商链，失败自动换下一个
-                        │        （全都失败就返回一句说明文字，不抛异常）
+                        │        （全员无数据 / 限流 → 返回一句说明文字，不中断本轮；
+                        │          核心类别若所有厂商都真报错 → 抛出该异常）
                         ▼
 厂商实现层      vendors/ —— 一个数据源一个模块
                         │
@@ -269,8 +270,11 @@ equity = cash + Σ(qty × mark_price)        # qty 带符号，空头为负，�
   调用方必须传入决策**之后**的参考价，成交价由 `fees` 在它基础上加减滑点。
   这是靠 **API 形状**拦住，不是靠注释提醒。
 - **费用与滑点分开记**：这是"策略赚的是价差还是被手续费吃了"的唯一依据。
-- **减仓 / 平仓永远允许**：`min_notional` 只约束"敞口变大"的下单，
-  否则一个跌到 5U 的仓位会因"不够最小下单额"而永远平不掉 —— 那正好把保护性退出堵死了。
+- **全平不受 `min_notional` 拦**：`ratio = 0` 在 ⑤ 校验里提前放行，`ledger.apply_order`
+  也只在"敞口变大"时校验最小下单额 —— 否则一个跌到 5U 的仓位会因"不够最小下单额"
+  而永远平不掉，那正好把保护性退出堵死了。
+  注意**部分减仓**不在此列：`evaluate` 是无条件校验 `min_notional` 的，所以一次减仓
+  若本次名义额低于最小下单额，仍会在 ⑤ 被拒 —— 那就直接全平。
 - 各子策略独立记账、**不做多空抵消**。
 
 ---
@@ -291,8 +295,10 @@ equity = cash + Σ(qty × mark_price)        # qty 带符号，空头为负，�
   缺任何一个直接拒（`ratio = 0` 清仓除外）。
 - **止损只能收紧**：`amend` 只接受朝有利方向的移动，放宽一律拒绝 ——
   防的是 LLM 浮亏时"再等等"那个本能。
-- **止损后冷却期**（默认 1800s）：刚被打掉不许立刻加大敞口，防报复性交易。
-  冷却期与熔断都**只挡"加大敞口"，减仓 / 平仓永远放行**。
+- **止损后冷却期**（默认 14400s = 一个唤醒周期）：刚被打掉不许立刻加大敞口，防报复性交易。
+  冷却期与熔断都**只挡"加大敞口"，减仓 / 平仓不受它们拦**。
+  注意冷却是**整策略级**的（`agent_runtime.cooldown_until` 一个字段，没有标的与方向维度）——
+  一次止损会冻结该策略下所有标的。
 
 被拒时**必须说清为什么**，原因回灌给 LLM 让它改正一次。
 比如触到单笔上限时，会明确告诉它"按当前止损距离，ratio 最多能开到多少"——
@@ -398,7 +404,7 @@ LLM 走 OpenAI 兼容协议，默认 provider 是 `deepseek`（key 从环境变�
 | `max_loss_per_trade_pct` | 单笔最大亏损（占起始权益），"不能亏太多"的那层兜底 |
 | `max_drawdown_halt` | 账户累计回撤熔断线，破了只许减仓 |
 | `stop_distance_min_pct` / `stop_distance_max_pct` | 止损距离的允许区间：太近是噪声，太远形同虚设 |
-| `cooldown_after_stop` | 止损后同方向的冷却时长，防报复性交易 |
+| `cooldown_after_stop` | 止损后**整策略**冷却时长，防报复性交易（冷却期内任意标的、任意方向都不许加大敞口） |
 | `default_exit_plan` | 默认退路：LLM 省略 `exit_plan` 时框架替它套上 |
 
 `AgentSpec.risk_cfg()` 把本策略的画像盖到全局配置上，下游（⑤ 校验、止损扫描、watchdog、
@@ -464,7 +470,7 @@ python -m pytest tests -q
 | `test_s1_ledger.py` | 撮合、费用、滑点、权益口径 |
 | `test_s2_watchdog.py` | 止损/止盈/移动止损被自动执行，**全程不涉及 LLM** |
 | `test_s3_tools.py` | 返回上限、失败哨兵、防前视、快照落库、**信息源的停摆/平静之分** |
-| `test_s4_loop.py` | 七步 loop 跑通、提案被拒的几种情形、指令出口 |
+| `test_s4_loop.py` | 七步 loop 跑通、提案被拒的几种情形、指令出口、**思考与工具调用落库且不影响决策** |
 | `test_s5_memory.py` | 三条记忆路径、反思闸门、防自我强化 |
 | `test_s6_risk_signals.py` | 三档风控兜底 + 指令落库/覆盖语义 |
 
@@ -479,9 +485,16 @@ python -m pytest tests -q
 | 账本 | `agents` `agent_runtime` `agent_budget` `agent_positions` `agent_fills` `equity_curve` | harness |
 | 指令 | `trade_signals` | harness |
 | 认知 | `agent_decisions` `agent_memory` `agent_stats` | harness |
+| 观测 | `agent_trace`（思考与工具调用的逐条轨迹，**旁路产物**） | harness |
 
 快照表的存在理由：**K 线体量大、不落库，但"你当时看到了什么"必须落库** ——
 没有它，K 线不落库就无法复盘归因。
+
+观测层单独存在的理由：终端上的实时输出是**一次性**的，而 `agent_decisions` 只留
+一个摘要（读过哪些工具 + 最后那句判断）—— 工具**返回的完整内容**、**中间推理**、
+**第几轮收敛**都不在任何表里。`agent_trace` 补的正是这一段：append-only、
+单字段超长会截断打标、写失败绝不影响决策（所以随时可删可重建）。
+读它用 `python -m harness --trace last`（或 `--trace <id 前缀>`）。
 
 ---
 
@@ -500,6 +513,7 @@ ccb-trade/
 │  │  ├─ scheduler.py         # Loop 1：定时唤醒
 │  │  ├─ watchdog.py          # Loop 2：止损 / 强平扫描（不碰 LLM）
 │  │  ├─ loop.py              # 七步 loop
+│  │  ├─ trace.py             # ★ 观测层：思考与工具调用落库 + 人可读时间轴
 │  │  ├─ signals.py           # ★ 交易指令出口
 │  │  ├─ exit_plan.py         # 退路的解析 / 校验 / 只能收紧
 │  │  ├─ memory.py            # 三条记忆路径

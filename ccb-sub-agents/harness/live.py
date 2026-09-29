@@ -18,7 +18,7 @@ import json
 import sys
 from typing import Callable, Iterable
 
-from harness import agents, scheduler, signals, watchdog
+from harness import agents, scheduler, signals, trace, watchdog
 from harness.clock import RealClock
 from harness.config import DEFAULT, Config
 from harness.llm import LLMClient
@@ -88,11 +88,14 @@ class WakeView:
                 self._raw("      ")
                 self._open = True
             self._raw(ev["text"])
+        elif kind == "round_end":
+            # 这一轮的话说完了 —— 收个尾，让段落断开（后面可能紧跟工具调用，也可能是收场）
+            self._close()
         elif kind == "tool_call":
             self._close()
             self._raw(f"   > {ev['name']}({_args(ev.get('args'))})\n")
         elif kind == "tool_result":
-            self._raw(f"     = {_clip(ev.get('result'), 220)}\n")
+            self._raw(f"     = {_clip(ev.get('result'), 220)}\n")   # ★ 220 字符截断在这里，事件本身是完整的
         elif kind == "degraded":
             self._close()
             self._raw(f"   ! {ev.get('reason')}\n")
@@ -100,6 +103,27 @@ class WakeView:
     def _when(self, ev) -> str:
         ts = ev.get("ts")
         return f"（{self.stamp(int(ts))}）" if (self.stamp and ts) else ""
+
+
+def _tee(*observers: Callable[[dict], None] | None) -> Callable[[dict], None] | None:
+    """把事件流同时发给多个观察者（终端渲染 + 轨迹落库）。
+
+    每个观察者**各自**吞掉自己的异常：一个坏了不该让另一个也瞎掉，
+    更不能让它们影响到 `loop`（那里面已经有兜底，这里是双保险）。
+    """
+    live = [o for o in observers if o is not None]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+
+    def fan_out(ev: dict) -> None:
+        for observer in live:
+            try:
+                observer(ev)
+            except Exception:
+                pass
+    return fan_out
 
 
 def banner(specs: Iterable[agents.AgentSpec], cfg: Config, llm_desc: str,
@@ -128,10 +152,14 @@ def run(conn, *, specs: Iterable[agents.AgentSpec], llm: LLMClient, candles,
     """跑起来。`ticks` 给定时跑完这么多 tick 就返回（预检用），否则一直跑。
 
     `stream=True` 时会把 LLM 的思考过程与每次工具调用实时打在终端上。
+    同时（`cfg.trace_enabled` 时）把它们落进 `agent_trace` —— 终端上滚过去的
+    东西是**一次性**的，落库之后才有人事后复盘的抓手（`python -m harness --trace last`）。
     """
     specs = list(specs)
     clock = RealClock()
     view = WakeView(printer, stream=stream)
+    recorder = trace.Recorder(conn, cfg=cfg, enabled=cfg.trace_enabled)
+    on_event = _tee(view, recorder)
     with conn:
         for s in specs:
             agents.register(conn, s, clock.now())
@@ -174,7 +202,7 @@ def run(conn, *, specs: Iterable[agents.AgentSpec], llm: LLMClient, candles,
 
             # ── Loop 1：唤醒决策 ─────────────────────────────────────
             results = scheduler.run_once(conn, clock, llm, specs=specs,
-                                         candles=candles, cfg=cfg, on_event=view)
+                                         candles=candles, cfg=cfg, on_event=on_event)
             for r in results:
                 stats["wakes"] += 1
                 stats["statuses"][r.status] = stats["statuses"].get(r.status, 0) + 1
@@ -204,7 +232,8 @@ def _log_wake(conn, r, printer: Callable[[str], None]) -> None:
     """把一次唤醒的产物摊开 —— 状态、依据、读了什么、成交了什么、**发了什么指令**。"""
     dec = repo.get_decision(conn, r.decision_id) or {}
     said = r.reason or dec.get("reasoning")
-    head = f"唤醒 {r.agent_id} -> {r.status}"
+    # 把 decision_id 一起印出来 —— 它是事后 `python -m harness --trace <id>` 的把手
+    head = f"唤醒 {r.agent_id} -> {r.status}  ｜ id={r.decision_id}"
     if said:
         head += f"  ｜ {_clip(said, 240)}"
     printer(head)

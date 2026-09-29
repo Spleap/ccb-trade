@@ -339,6 +339,61 @@ def insert_snapshot(conn, snapshot_id: str, agent_id: str, ts: int,
 
 
 # ============================================================
+# 轨迹（观测层，harness 写、append-only）
+# ============================================================
+
+
+def insert_trace(conn, trace_id: str, decision_id: str, agent_id: str, ts: int,
+                 seq: int, kind: str, payload: Any, truncated: int = 0) -> None:
+    """落一条轨迹。**旁路产物**：写它失败不该影响决策，调用方负责吞异常。"""
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_trace "
+        "(trace_id, decision_id, agent_id, ts, seq, kind, payload, truncated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (trace_id, decision_id, agent_id, ts, seq, kind, _j(payload), 1 if truncated else 0),
+    )
+
+
+def traces(conn, decision_id: str) -> list[dict]:
+    """按 `seq` 升序取一次唤醒的完整轨迹（回放顺序）。
+
+    `payload` 原样返回字符串 —— 解析交给上层（`harness/trace.py`），
+    仓储层不替调用方解释内容。
+    """
+    rows = conn.execute(
+        "SELECT * FROM agent_trace WHERE decision_id = ? ORDER BY seq",
+        (decision_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+def latest_decision(conn, agent_id: str | None = None) -> dict | None:
+    """最近一条决策。`--trace last` 用它把"最后一次唤醒"翻译成 decision_id。"""
+    if agent_id:
+        r = conn.execute(
+            "SELECT * FROM agent_decisions WHERE agent_id = ? ORDER BY ts DESC, rowid DESC LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+    else:
+        r = conn.execute(
+            "SELECT * FROM agent_decisions ORDER BY ts DESC, rowid DESC LIMIT 1").fetchone()
+    return dict(r) if r else None
+
+
+def find_decisions(conn, prefix: str, limit: int = 5) -> list[dict]:
+    """按 id 前缀找决策（倒序）。
+
+    `--trace` 用它：用户是从终端日志里抄一段 id 过来的，抄全 32 位不现实。
+    返回列表而不是单条 —— 前缀本来就可能撞上多条，得由调用方决定"是报歧义还是取最新"。
+    """
+    rows = conn.execute(
+        "SELECT * FROM agent_decisions WHERE decision_id LIKE ? ORDER BY ts DESC, rowid DESC LIMIT ?",
+        (f"{prefix}%", limit),
+    )
+    return [dict(r) for r in rows]
+
+
+# ============================================================
 # 记忆 / 统计
 # ============================================================
 

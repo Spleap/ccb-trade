@@ -146,10 +146,12 @@ python -m harness --no-llm --ticks 6    # 所有唤醒走降级，只验证风�
 | `max_drawdown_halt` | `0.30` | 账户累计回撤熔断线，破了只许减仓 |
 | `stop_distance_min_pct` | `0.0` | 止损距离下限（防"紧到只是噪声"），`0` = 不限 |
 | `stop_distance_max_pct` | `0.5` | 止损距离上限（防"名义上设了但形同虚设"） |
-| `cooldown_after_stop` | `14400` | 止损后同方向冷却秒数，防报复性交易 |
+| `cooldown_after_stop` | `14400` | 止损后**整策略**冷却秒数。冷却期内任意标的、任意方向都不许加大敞口（减仓 / 平仓不受它拦） |
 | `default_exit_plan` | 无 | 默认退路：LLM 省略 `exit_plan` 时框架替它套上 |
 
 > `cooldown_after_stop` 要 **≥ 一个唤醒周期**，否则它在下一轮唤醒前就过期了，等于没有。
+> 另外注意它的粒度是**整策略**：`agent_runtime.cooldown_until` 只有一个字段，没有标的
+> 与方向维度 —— BTC 上一个止损，会把该策略下所有标的一起冻结。
 
 ---
 
@@ -189,7 +191,12 @@ python -m harness --no-llm --ticks 6    # 所有唤醒走降级，只验证风�
 | `AAPL/USDT` | `AAPLUSDT` | `AAPL` |
 | `SPX/USDT` | `SPXUSDT` | `^GSPC` |
 | `XAU/USDT` | `XAUUSDT` | `GC=F`（COMEX 黄金期货） |
-| `EUR/USD` | `EURUSDUSDT` | `EURUSD=X` |
+| `EURUSD/USDT` | `EURUSDUSDT` | `EURUSD=X` |
+
+> 非加密品种的**写法要用别名表的键**：信息层只取符号里**第一段连续字母**去查别名表
+> （见 `_info_symbol`），所以 `EURUSD/USDT` 能正确翻成 `EURUSD=X`，
+> 而 `EUR/USD` 会被翻成并不存在的 `EUR-USD` —— 于是新闻永远查回空。
+> 同理 `NDX100/USDT → ^NDX`、`XAU/USDT → GC=F` 都是靠显式映射表，规则推不出来。
 
 **不限加密。** Bitget 的 `USDT-FUTURES` 里有美股（`AAPL` `NVDA` `TSLA` `MSFT` `META`
 `GOOGL` `AMZN`）、指数（`SPX` `NDX100` `HSI`）、贵金属（`XAU` `XAG`）、
@@ -300,10 +307,18 @@ python -m harness --no-llm --ticks 6
 
 # 换 LLM
 python -m harness --provider openrouter --model openai/gpt-4o-mini
+
+# 事后复盘：把某一次唤醒完整重放成人话（思考 + 每次工具调用的返回）
+python -m harness --trace last --agent my-agent-01
 ```
 
 调试时有几个抓手：
 
+- **`--trace` 是"它当时到底想了什么"的完整答案**。终端上的输出是**一次性**的，
+  所以同一份事件流也逐条落进了 `agent_trace` 表，`--trace last` 会把它重放成
+  一条人可读时间轴：第几轮、说了什么、调了哪个工具、**拿回了什么内容**、最后被拒在哪儿。
+  每次唤醒的日志行里都印着 `id=<decision_id>`，抄一段前缀就能定位那一次
+  （`--trace 9f3c1a2b`）。它只是**旁路产物**：写失败会被吞掉，删掉整张表也不影响任何判断。
 - **被拒的原因会回灌给 LLM**，它有一次改正机会。日志里 `rejected: …` 那句话就是设计给它的。
 - **`precheck` 是 LLM 的自我试算**，不产生任何后果 —— 它会先撞墙再正式提，省一轮往返。
 - **`market_snapshot` 表记录"它当时看到了什么"**。止损为什么在这个位置、它是根据哪根
@@ -322,7 +337,7 @@ python -m pytest tests -q
 | `test_s1_ledger.py` | 撮合、费用、滑点、权益口径 |
 | `test_s2_watchdog.py` | 止损/止盈/移动止损被自动执行，**全程不涉及 LLM** |
 | `test_s3_tools.py` | 返回上限、失败哨兵、防前视、快照落库、**信息源的停摆/平静之分** |
-| `test_s4_loop.py` | 七步 loop 跑通、提案被拒的几种情形、指令出口 |
+| `test_s4_loop.py` | 七步 loop 跑通、提案被拒的几种情形、指令出口、**思考与工具调用落库** |
 | `test_s5_memory.py` | 三条记忆路径、反思闸门、防自我强化 |
 | `test_s6_risk_signals.py` | 三档风控兜底 + 指令落库/覆盖语义 |
 
@@ -343,8 +358,13 @@ python -m pytest tests -q
 > **唯一的约束**：新源必须落进已定的 6 张表之一 ——
 > `news_items` / `social_items` / `market_events` / `prediction_quote` /
 > `macro_series` / `sentiment_index`。要凭空多一种"内容类型"，得同时动表、读工具
-> 和**两份必须逐字一致的 schema**（`info-feeds/.../collector/schema.sql` 与
-> `ccb-sub-agents/schema.sql`）。
+> 和 schema。
+>
+> 提到 schema 就得说清两份文件的关系：`info-feeds/.../collector/schema.sql` 与
+> `ccb-sub-agents/schema.sql` **不是整份相同**，而是**信息层那 7 张表
+> （上面 6 张 + `source_health`）的定义必须逐字一致**。差别在于采集侧那份多一张
+> `collector_state`（水位线，harness 不读），harness 那份多账本与认知层的全部表。
+> 改共享表就要改两边 —— 否则先后启动的两个进程会各自建出不同的表。
 
 接完源，把读工具用到的源名登记进 `harness/config.py` 的 `INFO_SOURCES` ——
 那样"采集挂了"才会被读侧认出来，报"数据源停摆"而不是"没有新闻"。

@@ -207,6 +207,31 @@ CREATE TABLE IF NOT EXISTS trade_signals (
 CREATE INDEX IF NOT EXISTS idx_signals_agent ON trade_signals(agent_id, ts);
 
 
+-- ── 观测层（harness 写，旁路）──────────────────────────────
+-- Agent 的**思考与工具调用轨迹**：它说了什么、调了哪个工具、拿回什么、几轮收敛。
+--
+-- 为什么单独一层：终端上的实时输出是**一次性**的（屏幕滚过去就没了），
+-- 而 `agent_decisions` 只留一个摘要（工具名 + 入参 + 最后的判断）——
+-- 工具返回的**内容**和**中间推理**全都不在库里。于是"它当时到底看到了什么、
+-- 想了几轮、为什么不动"这个问题，事后没有任何办法回答。
+--
+-- 它是**旁路产物，不是决策依据**：`agent_decisions` 才是。
+-- 写失败绝不影响决策（见 harness/trace.py），所以它可以随时删、随时重建。
+
+CREATE TABLE IF NOT EXISTS agent_trace (
+    trace_id    TEXT    PRIMARY KEY,        -- decision_id:seq —— 重跑可复现
+    decision_id TEXT    NOT NULL,
+    agent_id    TEXT    NOT NULL,
+    ts          INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,           -- 同一次唤醒内的顺序，按它回放
+    kind        TEXT    NOT NULL,           -- wake_start / thinking / text / tool_call / tool_result / degraded / signal
+    payload     TEXT    NOT NULL,           -- JSON；单字段超长会被截断
+    truncated   INTEGER NOT NULL DEFAULT 0  -- payload 是否被截断过
+);
+CREATE INDEX IF NOT EXISTS idx_trace_decision ON agent_trace(decision_id, seq);
+CREATE INDEX IF NOT EXISTS idx_trace_agent ON agent_trace(agent_id, ts);
+
+
 -- ── 认知层（harness 写）────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS agent_decisions (

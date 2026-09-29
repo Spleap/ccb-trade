@@ -52,6 +52,30 @@ Agent 自己不持有状态，每次唤醒从 DB 读、用完丢弃。两个进�
 
 ---
 
+## 它想了什么，看得见
+
+Agent 的思考与每次工具调用有**两条出口**，内容完全一致：
+
+| 出口 | 形态 | 用途 |
+|---|---|---|
+| 终端 | 实时流式：思考边生成边打、工具调用与返回逐条打 | 盯着它跑的时候看 |
+| DB `agent_trace` | 逐条 append-only：第几轮、说了什么、调了什么工具、拿回了什么 | 事后复盘 |
+
+终端上滚过去的东西是**一次性的**，所以同一份事件流也落库。每行唤醒日志都带
+`id=<decision_id>`，抄下来（或直接用 `--trace last`）就能把那次唤醒完整重放成人话：
+
+```bash
+python -m harness --trace last              # 最近一次唤醒
+python -m harness --trace 9f3c1a2b          # 按 id 前缀
+python -m harness --agent trend-scout-01 --trace last
+python -m harness --no-trace                # 不落库（只影响观测层，不影响决策）
+```
+
+`agent_trace` 是**旁路产物，不是决策依据**（决策依据是 `agent_decisions`）：
+写失败会被吞掉，删掉整张表也不影响任何一次判断。
+
+---
+
 ## 快速开始
 
 ### 1. 装依赖
@@ -90,6 +114,9 @@ python -m harness --ticks 6
 
 # 不接 LLM：只验证止损扫描与账本
 python -m harness --no-llm
+
+# 事后看它当时到底想了什么（思考 + 每次工具调用的返回）
+python -m harness --trace last
 ```
 
 ```bash
@@ -110,7 +137,7 @@ python -m info_feeds.collector --once   # 只跑一轮
 
 ```bash
 cd ccb-sub-agents
-python -m pytest tests -q        # 67 个
+python -m pytest tests -q        # 73 个
 ```
 
 ---
@@ -161,7 +188,7 @@ python -m pytest tests -q        # 67 个
 | `max_loss_per_trade_pct` | 单笔最大亏损（占起始权益），"不能亏太多"的兜底 |
 | `max_drawdown_halt` | 账户累计回撤熔断线，破了只许减仓 |
 | `stop_distance_min_pct` / `max_pct` | 止损距离的允许区间：太近是噪声，太远形同虚设 |
-| `cooldown_after_stop` | 止损后同方向的冷却时长（秒），防报复性交易 |
+| `cooldown_after_stop` | 止损后**整策略**冷却时长（秒）。冷却期内任意标的、任意方向都不许加大敞口（减仓 / 平仓不受它拦） |
 | `default_exit_plan` | 默认退路：LLM 省略 `exit_plan` 时框架替它套上 |
 | `tools` | 允许用的数据工具子集（账户/记忆/下单工具永远可用） |
 

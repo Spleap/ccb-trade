@@ -19,7 +19,7 @@
 | `max_loss_per_trade_pct` | 单笔最大亏损（占起始权益），"不能亏太多"的那层兜底 |
 | `max_drawdown_halt` | 账户累计回撤熔断线，破了只许减仓 |
 | `stop_distance_min_pct` / `max_pct` | 止损距离的允许区间：太近是噪声，太远形同虚设 |
-| `cooldown_after_stop` | 止损后同方向的冷却时长，防报复性交易 |
+| `cooldown_after_stop` | 止损后**整策略**冷却时长，防报复性交易（冷却期内任意标的、任意方向都不许加大敞口） |
 | `default_exit_plan` | 默认退路：LLM 省略 `exit_plan` 时框架替它套上的止盈止损 |
 
 **没写的字段回落全局默认值**（`Config`），所以老配置不用改；

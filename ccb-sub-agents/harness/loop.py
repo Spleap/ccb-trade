@@ -95,7 +95,8 @@ def run_once(conn, agent_id: str, clock, *, llm: LLMClient,
     """跑一次七步。实盘由 scheduler 驱动，测试里直接调它。
 
     `on_event` 是**旁路观察者**：调它的时候它按顺序收到 wake_start / thinking /
-    text / tool_call / tool_result / degraded，供终端实时渲染。
+    text / round_end / tool_call / tool_result / degraded / signal。
+    终端实时渲染（`live.WakeView`）与轨迹落库（`trace.Recorder`）都是它的消费者。
     不传它就完全静默，且结果一模一样。
     """
     now = clock.now()
@@ -108,7 +109,7 @@ def run_once(conn, agent_id: str, clock, *, llm: LLMClient,
     if agent is None:
         raise ValueError(f"不存在的 agent：{agent_id}")
 
-    _emit(on_event, "wake_start", agent=agent_id, ts=now)
+    _emit(on_event, "wake_start", agent=agent_id, ts=now, decision_id=decision_id)
 
     # ═══ ① LoadContext ═══════════════════════════════════════
     spec = spec or agents.spec_of(conn, agent_id)
@@ -215,6 +216,9 @@ def run_once(conn, agent_id: str, clock, *, llm: LLMClient,
         if fill:
             signal = signals.emit(conn, ctx, {**fresh, "leverage": v["leverage"]},
                                   decision_id, now, prop["reason"])
+            # 在 `with conn:` **里面**播 —— 落库的观察者（trace.Recorder）要跟着这一笔
+            # 一起提交；挪到外面的话，这最后一条轨迹会留在未提交的事务里丢掉。
+            _emit(on_event, "signal", signal=signal)
 
         _journal(conn, ctx, decision_id, now, reasoning=prop["reason"] or transcript,
                  target_ratio={prop["symbol"]: prop["ratio"]}, exit_plan=fresh["plan"],
@@ -222,9 +226,6 @@ def run_once(conn, agent_id: str, clock, *, llm: LLMClient,
                  degraded_reason=None if fill else "（未产生成交：目标与当前一致）")
         snapshot_id = flush_snapshot(ctx, decision_id)
         reflection = _derive_memory(conn, agent_id, decision_id, now, cfg, llm)
-
-    if signal is not None:
-        _emit(on_event, "signal", signal=signal)
 
     return WakeResult(agent_id, decision_id, now, "traded" if fill else "no_action",
                       reason=prop["reason"], fills=[fill] if fill else [],
@@ -259,6 +260,11 @@ def _converse(llm: LLMClient, registry: tools.Registry, ctx: ToolContext,
         messages.append(reply.as_message())
         if reply.content:
             texts.append(reply.content)
+
+        # 这一轮的话说完了（不管是接着调工具，还是就此收尾）。
+        # 对观察者是个**流式边界**：正文是按碎片回调的，这个事件之后就不会再来了，
+        # 所以攒碎片的消费者（`trace.Recorder`）拿它当"可以合并成一段落库"的信号。
+        _emit(on_event, "round_end", round=round_no + 1)
 
         if not reply.tool_calls:
             return texts, None

@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from harness import agents, loop, scheduler, tools        # noqa: E402
+from harness import agents, loop, scheduler, tools, trace   # noqa: E402
 from harness.clock import FixedClock                     # noqa: E402
 from harness.config import Config                          # noqa: E402
 from harness.llm import LLMReply, ScriptedClient, reply     # noqa: E402
@@ -340,6 +340,138 @@ def test_scheduler_respects_concurrency_cap():
     # ScriptedClient 无剧本 -> 被唤醒的那两个是 degraded，另两个原封不动
     assert len(results) == 2
     assert len(scheduler.due_agents(conn, T0)) == 1, "被截断的要留到下一轮，不是丢掉"
+    conn.close()
+
+
+# ── ⑧ 观测层：思考与工具调用必须留痕 ────────────────────────
+
+
+class DripClient:
+    """把正文按碎片吐给 `on_text`（模拟真实流式），最后回报一个完整 reply。
+
+    `ScriptedClient` 是一次性把整段话回调出去的，所以测不出"碎片合并"这件事。
+    """
+
+    def __init__(self, text: str, chunk: int = 4):
+        self.text = text
+        self.chunk = chunk
+
+    def chat(self, messages, tools=None, temperature=0.0, on_text=None):
+        if on_text:
+            for i in range(0, len(self.text), self.chunk):
+                on_text(self.text[i:i + self.chunk])
+        return LLMReply(content=self.text)
+
+
+TRADE_SCRIPT = [
+    reply("先看自己的状态。", ("get_my_portfolio", {})),
+    reply("取指标。", ("get_indicators", {"symbol": SYM, "names": ["atr14"], "tf": "1h"})),
+    reply("趋势成立。", ("propose_target", {"symbol": SYM, "ratio": 0.5,
+                                          "reason": "1h 通道完整，ATR 上行", "exit_plan": ENTRY_PLAN})),
+    reply("已提交。"),
+]
+
+
+def test_trace_records_thinking_and_tool_calls():
+    """终端上滚过去的东西必须留得下来 —— 尤其是工具**返回的内容**（§4.2）。"""
+    conn, spec, candles, clock = make_world()
+    rec = trace.Recorder(conn)
+    res = wake(conn, spec, candles, clock, ScriptedClient(list(TRADE_SCRIPT)), on_event=rec)
+    assert res.status == "traded", res
+
+    rows = repo.traces(conn, res.decision_id)
+    kinds = [r["kind"] for r in rows]
+    assert kinds[0] == "wake_start"
+    for want in ("thinking", "text", "tool_call", "tool_result", "signal"):
+        assert want in kinds, f"轨迹里少了 {want}：{kinds}"
+
+    # seq 从 1 起、严格递增 —— 回放顺序全靠它
+    assert [r["seq"] for r in rows] == list(range(1, len(rows) + 1))
+    assert all(r["decision_id"] == res.decision_id for r in rows)
+    assert all(r["agent_id"] == spec.agent_id for r in rows)
+
+    # 关键一条：工具**拿回了什么**必须落库，否则"它当时看到了什么"无从回答
+    results = [json.loads(r["payload"]) for r in rows if r["kind"] == "tool_result"]
+    assert any("atr14" in json.dumps(p) for p in results), results
+    calls = [json.loads(r["payload"]) for r in rows if r["kind"] == "tool_call"]
+    assert any(c["name"] == "get_indicators" for c in calls), calls
+    conn.close()
+
+
+def test_streamed_text_is_merged_into_one_row():
+    """LLM 的正文是**按碎片**回调的 —— 落库时必须合并成一段，不能一碎一碎地存几百行。"""
+    conn, spec, candles, clock = make_world()
+    text = "行情没什么变化，这一轮我不动。"
+    rec = trace.Recorder(conn)
+    res = wake(conn, spec, candles, clock, DripClient(text, chunk=2), on_event=rec)
+    assert res.status == "no_action", res
+
+    texts = [json.loads(r["payload"])["text"] for r in repo.traces(conn, res.decision_id)
+             if r["kind"] == "text"]
+    assert texts == [text], f"碎片没合并：{texts}"
+    conn.close()
+
+
+def test_trace_does_not_change_the_decision():
+    """观察者是**旁路**：开着它和关着它，决策必须一字不差。"""
+    def run(with_recorder: bool):
+        conn, spec, candles, clock = make_world()
+        kw = {"on_event": trace.Recorder(conn)} if with_recorder else {}
+        res = wake(conn, spec, candles, clock, ScriptedClient(list(TRADE_SCRIPT)), **kw)
+        row = dict(conn.execute("SELECT * FROM agent_decisions WHERE decision_id = ?",
+                                (res.decision_id,)).fetchone())
+        row.pop("decision_id")
+        row.pop("ts")
+        out = (res.status, row, repo.get_positions(conn, spec.agent_id),
+               repo.get_fills(conn, spec.agent_id))
+        conn.close()
+        return out
+
+    assert run(True) == run(False)
+
+
+def test_broken_recorder_cannot_break_the_decision():
+    """记录器坏了（这里是把连接关掉）也不能影响决策 —— 观察者不该有搞砸被观察者的能力。"""
+    conn, spec, candles, clock = make_world()
+    dead = db.connect(":memory:")
+    dead.close()
+    res = wake(conn, spec, candles, clock, ScriptedClient(list(TRADE_SCRIPT)),
+               on_event=trace.Recorder(dead))
+    assert res.status == "traded", res
+    assert repo.get_position(conn, spec.agent_id, SYM) is not None
+    conn.close()
+
+
+def test_long_payload_is_flagged_truncated():
+    """单字段超长要截断并打标记 —— 但**决策用的原文不受影响**（截断只发生在轨迹里）。"""
+    conn, spec, candles, clock = make_world()
+    rec = trace.Recorder(conn, cfg=Config(trace_max_chars=40))
+    res = wake(conn, spec, candles, clock, ScriptedClient(list(TRADE_SCRIPT)), on_event=rec)
+
+    big = [r for r in repo.traces(conn, res.decision_id)
+           if r["kind"] == "tool_result" and r["truncated"]]
+    assert big, "超长的工具返回应当被标记为已截断"
+    assert "已截断" in big[0]["payload"]
+    # 决策记录里的 inputs_summary 是另一条路径，不该被轨迹的截断牵连
+    row = repo.get_decision(conn, res.decision_id)
+    assert "get_indicators" in row["inputs_summary"]
+    conn.close()
+
+
+def test_render_shows_a_readable_timeline():
+    conn, spec, candles, clock = make_world()
+    res = wake(conn, spec, candles, clock, ScriptedClient(list(TRADE_SCRIPT)),
+               on_event=trace.Recorder(conn))
+
+    out = trace.render(conn, res.decision_id)
+    assert res.decision_id in out
+    assert "第 1 轮" in out and "get_indicators" in out
+    assert "结局" in out and "result = accepted" in out
+    # 决策在、轨迹不在（本功能上线前跑的）：要说清楚"是没有"，不能是报错也不能是空白
+    conn.execute("DELETE FROM agent_trace WHERE decision_id = ?", (res.decision_id,))
+    assert "没有轨迹" in trace.render(conn, res.decision_id)
+    # 连决策都没有：同样得是一句人话
+    assert "库里没有这条决策" in trace.render(conn, "dec-不存在")
     conn.close()
 
 
