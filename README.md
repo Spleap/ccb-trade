@@ -68,7 +68,7 @@ python -m info_feeds.collector --once   # 只跑一轮
 
 ```bash
 cd ccb-sub-agents
-python -m pytest tests -q        # 53 个
+python -m pytest tests -q        # 57 个
 ```
 
 ---
@@ -89,7 +89,7 @@ python -m pytest tests -q        # 53 个
   "gross_cap": 3.0,
   "leverage": 1,
   "starting_equity": 1000.0,
-  "tools": ["get_candles", "get_indicators", "get_news", "get_sentiment"]
+  "tools": ["get_candles", "get_indicators", "get_derivatives", "get_news", "get_sentiment"]
 }
 ```
 
@@ -105,6 +105,29 @@ python -m pytest tests -q        # 53 个
 | `tools` | 允许用的数据工具子集（账户/记忆/下单工具永远可用） |
 
 **人设可以随便写，但写不出一个能突破风控的 Agent** —— 风控由代码执行，提示词只是让它提前知道。
+
+---
+
+## 它有哪些工具
+
+分四类。**能裁的只有 A 类**（配置里 `tools` 字段）—— 看自己、记忆、下单出口永远在。
+
+| 类 | 工具 |
+|---|---|
+| A 数据 | `get_candles` `get_indicators` `get_derivatives` `get_news` `get_global_news` `get_sentiment` `get_sentiment_index` `get_market_events` `get_prediction_market` `get_macro` |
+| B 账户 | `get_my_portfolio` `get_my_budget` `get_my_recent_decisions` |
+| C 记忆 | `recall` |
+| D 决策 | `propose_target` `get_exit_plan` `amend_exit_plan` `precheck` |
+
+**行情来自 Bitget USDT-FUTURES 永续**（不是现货 —— 止损与强平都按合约价算）：
+
+- **K 线**：只含**已完结**的 bar，正在走的那根永远被挡在外面（防前视）。
+- **技术指标**：服务端算，不让模型自己算（同一个 RSI 两次算出不同值，就没法复盘了）。
+  目前支持 `sma20` `sma50` `ema12` `ema26` `rsi14` `atr14` `macd` `boll20`。
+- **派生品指标** `get_derivatives`：持仓量 OI、资金费率（当期 + 最近若干期）、标记价、指数价、基差。
+  杠杆策略的必看项 —— 费率是持仓成本与多空拥挤度，OI 是这个方向上有多少钱在下注。
+  ⚠ **OI 只有当前值**：Bitget 不提供 OI 历史序列（`type=open_interest` 那个接口是个陷阱，
+  它会静默返回普通 K 线），所以别指望它给趋势。
 
 ---
 

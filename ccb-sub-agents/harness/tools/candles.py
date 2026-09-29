@@ -4,7 +4,7 @@ K 线体量太大，不落库、唤醒时按需拉 —— 所以这里是一个*
 
 | 场景 | 实现 |
 |---|---|
-| 实盘 | `BitgetCandleSource`：直接打 Bitget 现货 v2 candles |
+| 实盘 | `BitgetCandleSource`：直接打 Bitget **USDT-FUTURES 永续** v3 candles |
 | 测试 / 离线 | `ListCandleSource`：从给定的 bars 里按 `as_of` 切片 |
 
 **防前视统一在这一层做（§7.2 / §2.6）**：一个 bar 只有在
@@ -51,34 +51,30 @@ class ListCandleSource:
 
 
 # ============================================================
-# 实盘：Bitget 现货 v2
+# 实盘：Bitget USDT-FUTURES 永续 v3
 # ============================================================
 
-_BITGET_URL = "https://api.bitget.com/api/v2/spot/market/candles"
+_BITGET_URL = "https://api.bitget.com/api/v3/market/candles"
+_BITGET_CATEGORY = "USDT-FUTURES"
 
-# 本地周期名 -> Bitget granularity。Bitget 用小写，且 1m/1d 拼作 1min/1day。
-_BITGET_GRANULARITY = {
-    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1h", "4h": "4h", "1d": "1day",
+# 本地周期名 -> Bitget interval。**H / D 必须大写**：实测 `1h` / `1d` 直接 HTTP 400，
+# `1H` / `1D` 才认。分钟级反而是小写。
+_BITGET_INTERVAL = {
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1H", "4h": "4H", "1d": "1D",
 }
 
-# Bitget 单次请求的**两个**上限，必须取更严的那个：
-#   ① 根数上限 1000
-#   ② **时间跨度上限 30 天** —— 实测：1h 请求 720 根（29.96 天）正常，
-#      721 根（30.0 天）时第二页直接返回空。这是 Bitget 侧的限制，
-#      不是分页写错了。所以按周期把 30 天换算成根数，与 1000 取小值。
-# 只有 1h 及更粗的周期会被这条卡住：15m × 1000 只有 10.4 天，离上限还很远。
-_PAGE_BARS = 1000
-_MAX_SPAN_SECONDS = 30 * 86400
+# 单次请求的根数上限。实测：1000 正常，1500 / 3000 直接 400。
+# 注意 v2 现货时代还有一条"单次最多 30 天"的跨度限制，v3 没有 ——
+# 实测 1H × 1000 根（41.6 天）正常返回。
+_MAX_BARS_PER_REQUEST = 1000
 
 
-def _max_bars_per_request(tf: str) -> int:
-    """单次请求该周期最多能要多少根。"""
-    return max(1, min(_PAGE_BARS, _MAX_SPAN_SECONDS // TF_SECONDS[tf]))
+def bitget_symbol(symbol: str) -> str:
+    """把 agent 口径的符号翻成 Bitget 口径：`BTC/USDT` / `BTC-USD` / `BTC` -> `BTCUSDT`。
 
-
-def _bitget_symbol(symbol: str) -> str:
-    """把 agent 口径的符号翻成 Bitget 口径：`BTC/USDT` / `BTC-USD` / `BTC` -> `BTCUSDT`。"""
+    永续合约的 `USDT-FUTURES` 与现货用同一套符号（`BTCUSDT`），所以这套映射通用。
+    """
     s = re.sub(r"[^A-Za-z0-9]", "", symbol).upper()
     if s.endswith("USDT") or s.endswith("USDC"):
         return s
@@ -88,13 +84,16 @@ def _bitget_symbol(symbol: str) -> str:
 
 
 class BitgetCandleSource:
-    """实盘 K 线源：直接打 Bitget 现货 v2 candles。
+    """实盘 K 线源：直接打 Bitget **USDT-FUTURES 永续** v3 candles。
+
+    用永续而不是现货，是为了和 Agent 实际交易的口径对齐 ——
+    现货与合约有基差，止损/强平都按合约价格算，行情就不该用现货。
 
     三件事在 `fetch` 里一次做对：
 
-    * **符号/周期映射** —— agent 说 `BTC/USDT` + `1h`，Bitget 要 `BTCUSDT` + `1h`
+    * **符号/周期映射** —— agent 说 `BTC/USDT` + `1h`，Bitget 要 `BTCUSDT` + `1H`
     * **防前视**（§2.6）—— 只吐 `ts + tf秒数 <= as_of` 的**已完结** bar，
-      正在走的那一根永远被挡在外面
+      v3 实测**会返回正在走的那一根**，所以这个过滤不是可选项
     * **缓存** —— 同一 tick 内 watchdog / scheduler 会重复问
       同一个 (symbol, tf)，用短 TTL 缓存挡掉；**只缓存成功**，失败绝不缓存
       （否则一次网络抖动会被缓存成一个 tick 的空数据）
@@ -127,31 +126,32 @@ class BitgetCandleSource:
 
     def _download(self, symbol: str, tf: str, limit: int) -> list[dict]:
         # 多取 2 根：as_of 过滤可能吃掉正在走的一根，甚至刚收的一根
-        return _bitget_candles(symbol, tf, min(int(limit) + 2, _max_bars_per_request(tf)),
+        return _bitget_candles(symbol, tf, min(int(limit) + 2, _MAX_BARS_PER_REQUEST),
                                self.timeout)
 
 
 # ============================================================
-# Bitget 现货 K 线：底层请求
+# Bitget 永续 K 线：底层请求
 # ============================================================
 
 
 def _bitget_request(url: str, symbol: str, tf: str, limit: int, timeout: float,
                     end_time_ms: int | None) -> list[dict]:
-    """打一次 Bitget 现货 K 线接口，返回**升序** OHLCV（不做任何截断/过滤）。
+    """打一次 Bitget K 线接口，返回**升序** OHLCV（不做任何截断/过滤）。
 
-    每行 `[ts(ms), open, high, low, close, baseVol, quoteVol, ...]`。
+    每行 `[ts(ms), open, high, low, close, baseVol, quoteVol]`，定长 7 元。
     Bitget 原生就是**升序**（实测：limit=5 时第 0 行是最旧的一根，
     最后一根是正在走的那根），**不要 reverse** —— 反转会让 `closed[-limit:]`
     取到最旧的 N 根，整个窗口系统性地滞后 1~2 根。
 
     `end_time_ms` 是给翻页用的：只要截止在这一刻（含）之前的 K 线。
     """
-    if tf not in _BITGET_GRANULARITY:
+    if tf not in _BITGET_INTERVAL:
         raise ValueError(f"不支持的周期 {tf!r}")
     params = {
-        "symbol": _bitget_symbol(symbol),
-        "granularity": _BITGET_GRANULARITY[tf],
+        "category": _BITGET_CATEGORY,           # v3 必填：不传 category 会拿错品种类别
+        "symbol": bitget_symbol(symbol),
+        "interval": _BITGET_INTERVAL[tf],
         "limit": max(1, int(limit)),
     }
     if end_time_ms is not None:
@@ -178,9 +178,9 @@ def _bitget_request(url: str, symbol: str, tf: str, limit: int, timeout: float,
 
 def _bitget_candles(symbol: str, tf: str, limit: int, timeout: float = 10.0,
                     end_time_ms: int | None = None) -> list[dict]:
-    """`/candles`：只服务**最近**一段历史。limit 按 `_max_bars_per_request` 收口。"""
+    """`/candles`：只服务**最近**一段历史。limit 按 `_MAX_BARS_PER_REQUEST` 收口。"""
     return _bitget_request(_BITGET_URL, symbol, tf,
-                           min(int(limit), _max_bars_per_request(tf)),
+                           min(int(limit), _MAX_BARS_PER_REQUEST),
                            timeout, end_time_ms)
 
 

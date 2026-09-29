@@ -12,6 +12,7 @@
   "tools": [
     "get_candles",
     "get_indicators",
+    "get_derivatives",
     "get_news",
     "get_global_news",
     "get_sentiment",

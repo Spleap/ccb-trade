@@ -12,6 +12,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from harness import tools                                   # noqa: E402
 from harness.config import Config                            # noqa: E402
 from harness.tools import data as data_tools                 # noqa: E402
+from harness.tools import derivatives                        # noqa: E402
 from harness.tools.base import Tool, ToolContext, unavailable  # noqa: E402
 from harness.store import db, repo                           # noqa: E402
 
@@ -155,6 +156,113 @@ def test_snapshot_is_flushed_to_db():
     assert SYM in row["payload"] and "rsi14" in row["payload"]
     assert tools.flush_snapshot(make_ctx()) is None, "没读到东西就不该产生快照行"
     ctx.conn.close()
+
+
+# ── 派生品指标：OI 与资金费率（只能来自永续合约）──────────────
+
+_TICKERS = [{"lastPrice": "83840.7", "markPrice": "83836.5", "indexPrice": "83880.8",
+             "fundingRate": "0.000005", "openInterest": "31451.6",
+             "price24hPcnt": "0.00354", "turnover24h": "2603534020.0"}]
+_FUND_NOW = [{"fundingRate": "0.000005", "fundingRateInterval": "8",
+              "nextUpdate": str((T0 + 3 * 3600) * 1000)}]
+# 接口给的是**倒序**，且故意混进一根"未来"的结算 —— 两者都必须被纠正/剔除
+_FUND_HIST = [{"fundingTime": str((T0 + 8 * 3600) * 1000), "fundingRate": "0.0009"},
+              {"fundingTime": str(T0 * 1000), "fundingRate": "-0.0002"},
+              {"fundingTime": str((T0 - 8 * 3600) * 1000), "fundingRate": "0.0001"}]
+
+
+def _patch(routes: dict):
+    """把 HTTP 层换成预置数据。routes: path -> data 或要抛的异常。"""
+    orig = derivatives._get_json
+
+    def fake(path, params, timeout=10.0):
+        if path not in routes:
+            raise AssertionError(f"测试没有预置这个请求：{path}")
+        value = routes[path]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    derivatives._get_json = fake
+    return orig
+
+
+def test_derivatives_formats_records_and_admits_oi_has_no_history():
+    ctx = make_ctx()
+    orig = _patch({"/api/v3/market/tickers": _TICKERS,
+                   "/api/v2/mix/market/current-fund-rate": _FUND_NOW,
+                   "/api/v2/mix/market/history-fund-rate": _FUND_HIST})
+    try:
+        out = data_tools.get_derivatives(ctx, SYM)
+    finally:
+        derivatives._get_json = orig
+
+    assert not tools.is_unavailable(out), out
+    assert "持仓量 OI" in out and "31,451.6" in out
+    # ★ 这条是防"OI 历史陷阱"的行为保证：不许让 LLM 以为它看到的是趋势
+    assert "不提供 OI 历史序列" in out, out
+    # 结算节奏
+    assert "下次结算" in out and "还有 3.0h" in out
+
+    # 序列：倒序被排回升序，未来那根（+0.0900%）被剔除
+    assert "+0.0100%, -0.0200%" in out, out
+    assert "0.0900" not in out, "决策之后才结算的费率绝不能出现在上下文里"
+    assert "均值 -0.0050%" in out
+
+    # 基差 = (标记 - 指数) / 指数
+    assert "-0.0528%" in out and "标记 < 指数" in out
+
+    # 数字必须落进快照 —— "你当时看到了什么"
+    snap = ctx.snapshot[SYM]
+    assert snap["oi"] == 31451.6 and snap["funding_rate"] == 0.000005
+    assert snap["mark_price"] == 83836.5 and snap["index_price"] == 83880.8
+    assert snap["funding_next_ts"] == T0 + 3 * 3600
+    ctx.conn.close()
+
+
+def test_derivatives_degrade_visibly_not_silently():
+    """tickers 是硬数据（挂了就整体失败）；费率序列是加分项（挂了要明说，不许静默少一段）。"""
+    ctx = make_ctx()
+    orig = _patch({"/api/v3/market/tickers": _TICKERS,
+                   "/api/v2/mix/market/current-fund-rate": RuntimeError("boom"),
+                   "/api/v2/mix/market/history-fund-rate": RuntimeError("boom")})
+    try:
+        out = data_tools.get_derivatives(ctx, SYM)
+    finally:
+        derivatives._get_json = orig
+
+    assert not tools.is_unavailable(out), "加分项挂了不该让整个工具失败"
+    assert "持仓量 OI" in out, "OI 是硬数据，必须还在"
+    assert "部分数据取不到" in out and "取不到" in out, "少一段必须说出来，不能静默"
+    ctx.conn.close()
+
+
+def test_derivatives_sentinel_when_no_perp():
+    """tickers 拿不到（比如给了一个没有永续的符号）→ 走哨兵，不是空字符串。"""
+    ctx = make_ctx()
+    orig = _patch({"/api/v3/market/tickers": RuntimeError("没有这个品种")})
+    try:
+        out = tools.full_registry().run("get_derivatives", ctx, symbol=SYM)
+    finally:
+        derivatives._get_json = orig
+
+    assert tools.is_unavailable(out) and "没有这个品种" in out
+    assert ctx.failures(), "绝不静默失败（§3.5）"
+    ctx.conn.close()
+
+
+def test_funding_history_sorted_ascending_and_clamped():
+    orig = _patch({"/api/v2/mix/market/history-fund-rate": _FUND_HIST})
+    try:
+        rows = derivatives.funding_history(SYM, 12, as_of=T0)
+    finally:
+        derivatives._get_json = orig
+    assert [r["ts"] for r in rows] == [T0 - 8 * 3600, T0], "必须排回升序"
+    assert [r["rate"] for r in rows] == [0.0001, -0.0002]
+
+    # 服务端再夹一次期数，别信 LLM 填的
+    assert data_tools._periods(9999) == derivatives.MAX_PERIODS
+    assert data_tools._periods(None) == 12 and data_tools._periods(0) == 12
 
 
 def test_registry_is_prunable_by_strategy():

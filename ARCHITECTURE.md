@@ -26,7 +26,7 @@
                     └─────────────────┬──────────────────┘
                                       │ 按需拉（K 线不落库）
                                       ▼
-                              Bitget 现货 candles v2
+                      Bitget USDT-FUTURES 永续 candles v3
                                       │
                                       ▼
                           trade_signals（交付给下游执行方）
@@ -181,10 +181,32 @@
 
 | 类 | 模块 | 工具 |
 |---|---|---|
-| A 数据 | `tools/data.py` | `get_candles` `get_indicators` `get_news` `get_global_news` `get_sentiment` `get_sentiment_index` `get_market_events` `get_prediction_market` `get_macro` |
+| A 数据 | `tools/data.py` | `get_candles` `get_indicators` `get_derivatives` `get_news` `get_global_news` `get_sentiment` `get_sentiment_index` `get_market_events` `get_prediction_market` `get_macro` |
 | B 账户 | `tools/account.py` | `get_my_portfolio` `get_my_budget` `get_my_recent_decisions` |
 | C 记忆 | `tools/memory.py` | `recall` |
 | D 决策 | `tools/decision.py` | `propose_target` `get_exit_plan` `amend_exit_plan` `precheck` |
+
+A 类的行情分两条来源：
+
+- **`get_candles` / `get_indicators`** —— K 线与指标，经 `ctx.candles` 注入。
+  实盘走 `BitgetCandleSource`：**USDT-FUTURES 永续** v3 candles
+  （`/api/v3/market/candles`，`category=USDT-FUTURES`）。用永续而不是现货，
+  是为了跟 Agent 实际交易的口径对齐 —— 现货与合约有基差，止损/强平都按合约价算。
+  三条实测踩过的坑都写在 `candles.py` 里：`interval` 的 **H/D 必须大写**（`1h` 直接 400）、
+  单次上限 **1000 根**（1500 → 400）、v3 **会返回正在走的那根 bar** 所以防前视过滤不是可选项。
+- **`get_derivatives`** —— OI / 资金费率 / 标记价 / 指数价 / 基差，直接打 Bitget（`derivatives.py`）。
+  只做永续：这两个指标只在合约上存在。**它是杠杆策略的必看项** ——
+  费率是持仓成本也是多空拥挤度的直接读数，OI 是这个方向上有多少钱在下注。
+  两个实测结论决定了它的形状：
+  - **资金费率有历史序列**（`/api/v2/mix/market/history-fund-rate`，8 小时一期，实测可回溯约 33 天），
+    接口给倒序，要排回升序；结算时间晚于 `as_of` 的期数一律剔除（与 K 线同一条防前视纪律）。
+  - **OI 只有当前值，没有历史序列。** Bitget 没有 OI 历史接口；而
+    `/api/v3/market/candles?type=open_interest` 是个**陷阱** —— 它不报错，
+    而是**静默回落成普通成交价 K 线**（实测返回值与 `type=normal` 逐字相同，
+    而真实 OI 是前者量级的 1/3）。所以代码**绝不请求那个 type**，
+    并且在返回文本里**明说"没有序列"** —— 让 LLM 知道自己看不到趋势，
+    而不是让它把一条假序列当趋势。真要看 OI 的变化，靠每轮把现值落进
+    `market_snapshot`，序列由快照表自然积累。
 
 三条**框架级**约定（不靠 LLM 自觉）：
 
