@@ -26,7 +26,8 @@ PriceFn = Callable[[str, int], "float | None"]
 
 
 def run_once(conn, clock, price_fn: PriceFn, cfg: Config = DEFAULT,
-             leverage_of: Callable[[str], float] | None = None) -> list[dict]:
+             leverage_of: Callable[[str], float] | None = None,
+             cfg_of: Callable[[str], Config] | None = None) -> list[dict]:
     """扫一遍所有 active agent 的持仓，命中退路就平掉。
 
     返回本次触发的平仓记录，交给上层写日志/面板。**幂等**：同一 tick 重复调用
@@ -35,12 +36,17 @@ def run_once(conn, clock, price_fn: PriceFn, cfg: Config = DEFAULT,
     `leverage_of` 给定且某 agent 的杠杆 > 1 时，额外做一次**强平判定** ——
     这是杠杆唯一的"额外风控"，也是它和现货最本质的差别：
     现货最多亏到零，杠杆会**亏穿**，必须在权益见底之前先动手。
+
+    `cfg_of` 给每个 agent 取它自己那份配置（风险偏好是按策略写的）。
+    止损后的冷却时长就来自这里 —— 用一个全局冷却期套所有策略，
+    对 15m 高频是过紧、对 4h 波段是等于没有。
     """
     now = clock.now()
     closed: list[dict] = []
 
     for agent in repo.list_agents(conn, "active"):
         agent_id = agent["agent_id"]
+        agent_cfg = (cfg_of(agent_id) if cfg_of else None) or cfg
         prices: dict[str, float] = {}
         dirty = False
 
@@ -64,11 +70,11 @@ def run_once(conn, clock, price_fn: PriceFn, cfg: Config = DEFAULT,
 
             fill = ledger.apply_order(
                 conn, agent_id, symbol, -float(pos["qty"]), mark, now,
-                close_reason=reason, cfg=cfg,
+                close_reason=reason, cfg=agent_cfg,
             )
             if reason in exit_plan.STOP_REASONS:
                 # 防报复性交易：刚被打掉不许立刻打回去（§9.4 防作弊 2）
-                repo.set_cooldown(conn, agent_id, now + cfg.cooldown_after_stop)
+                repo.set_cooldown(conn, agent_id, now + agent_cfg.cooldown_after_stop)
 
             closed.append({
                 "agent_id": agent_id,
@@ -83,14 +89,14 @@ def run_once(conn, clock, price_fn: PriceFn, cfg: Config = DEFAULT,
         # ② 止损扫完之后再看强平：强平优先于把它当成一次普通止损
         leverage = float(leverage_of(agent_id) or 1.0) if leverage_of else 1.0
         if leverage > 1.0:
-            blown = _liquidate_if_blown(conn, agent_id, prices, now, cfg)
+            blown = _liquidate_if_blown(conn, agent_id, prices, now, agent_cfg)
             if blown:
                 closed.extend(blown)
                 dirty = True
 
         if dirty:
             # 平仓改了现金和持仓，权益曲线要立刻反映，不能等到下个 tick
-            ledger.write_equity(conn, agent_id, now, prices, cfg)
+            ledger.write_equity(conn, agent_id, now, prices, agent_cfg)
 
     return closed
 
@@ -151,9 +157,10 @@ def _advance_peak(pos: dict, mark: float) -> float:
 
 def run_forever(conn, clock, price_fn: PriceFn, cfg: Config = DEFAULT,
                 leverage_of: Callable[[str], float] | None = None,
+                cfg_of: Callable[[str], Config] | None = None,
                 should_stop: Callable[[], bool] | None = None) -> None:
     """Loop 2 常驻。测试里不要用它 —— 逐次调 `run_once`。"""
     while not (should_stop and should_stop()):
         with conn:
-            run_once(conn, clock, price_fn, cfg, leverage_of)
+            run_once(conn, clock, price_fn, cfg, leverage_of, cfg_of)
         clock.sleep(cfg.watchdog_interval)

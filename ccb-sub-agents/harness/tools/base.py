@@ -65,6 +65,8 @@ class ToolContext:
     equity: float = 0.0
     starting_equity: float = 0.0              # 该子账户的起始权益，累计回撤熔断用
     leverage: float = 1.0                     # 名义放大倍数（来自 AgentSpec）
+    universe: tuple[str, ...] = ()            # 品种池（来自 AgentSpec）；空元组 = 不校验
+    default_exit_plan: dict | None = None     # 本策略的默认退路（来自 AgentSpec）
 
     # ── 决策缓冲：D 类工具唯一被允许的"写"（§4.2 第 1 条）────────
     # LLM 不能写 DB。它只能往这三个槽里放"意图"，由 loop 在 ⑤⑥ 统一裁决与执行。

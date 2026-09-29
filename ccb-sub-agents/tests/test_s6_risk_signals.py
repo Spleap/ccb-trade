@@ -16,11 +16,12 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from harness import exit_plan, signals                    # noqa: E402
-from harness.config import Config                          # noqa: E402
+from harness import agents, exit_plan, signals            # noqa: E402
+from harness.config import DEFAULT, Config                 # noqa: E402
 from harness.store import db, repo                         # noqa: E402
 from harness.tools import decision as decision_tools       # noqa: E402
 from harness.tools.base import ToolContext                 # noqa: E402
+from harness.tools.candles import ListCandleSource         # noqa: E402
 
 T0 = 1_700_000_000
 SYM = "BTC/USDT"
@@ -31,9 +32,19 @@ PLAN = {"stop_loss": {"type": "pct", "value": 0.05},
         "take_profit": {"type": "pct", "value": 0.10}}
 
 
+def _bars(n: int = 60) -> list[dict]:
+    """n 根已完结的 1h bar。high-low 恒为 200，且跳空不超过它 -> ATR14 = 200。"""
+    start = T0 - n * 3600
+    return [{"ts": start + i * 3600, "open": 60_000.0 + i * 100,
+             "high": 60_100.0 + i * 100, "low": 59_900.0 + i * 100,
+             "close": 60_000.0 + i * 100, "volume": 10.0 + i} for i in range(n)]
+
+
 def make_ctx(equity: float = 1000.0, starting_equity: float = 1000.0,
              leverage: float = 1.0, w: float = 0.5, gross_cap: float = 1.0,
-             mark: float = MARK, cfg: Config = Config()) -> ToolContext:
+             mark: float = MARK, cfg: Config = Config(),
+             universe: tuple[str, ...] = (), candles=None,
+             default_exit_plan: dict | None = None) -> ToolContext:
     """一个手搭的决策上下文：预算 / 权益 / 杠杆都直接给定，绕开账本。"""
     conn = db.connect(":memory:")
     repo.create_agent(conn, "a1", "测试员", "test", 3600, starting_equity, T0)
@@ -41,7 +52,9 @@ def make_ctx(equity: float = 1000.0, starting_equity: float = 1000.0,
         repo.set_budget(conn, "a1", "t1", w, gross_cap, T0)
     return ToolContext(conn=conn, agent_id="a1", as_of=T0, cfg=cfg, tf="1h",
                        mark=lambda _sym: mark, budget=repo.get_budget(conn, "a1"),
-                       equity=equity, starting_equity=starting_equity, leverage=leverage)
+                       equity=equity, starting_equity=starting_equity, leverage=leverage,
+                       universe=universe, candles=candles,
+                       default_exit_plan=default_exit_plan)
 
 
 # ── 闸门 1：单笔最大亏损 ────────────────────────────────────
@@ -124,6 +137,99 @@ def test_take_profit_is_mandatory():
     plan = exit_plan.resolve({"stop_loss": {"type": "pct", "value": 0.05}}, 1, MARK)
     ok, why = exit_plan.validate(plan, 1, MARK)
     assert not ok and "缺少止盈" in why, why
+
+
+# ── 品种池：创建时就定好，池外一律拒（§5.3）─────────────────
+
+
+def test_universe_rejects_outside_symbol_but_still_allows_flat():
+    """品种池外的品种一律不许碰 —— 提示词里写着不算数，得在协议层拦下来。"""
+    ctx = make_ctx(universe=("BTC/USDT",))
+    v = decision_tools.evaluate(ctx, "ETH/USDT", 0.3, PLAN)
+
+    assert not v["ok"] and "不在你的品种池内" in v["reason"], v
+    # 但清仓（ratio=0）永远放行：池子是被改小的，旧持仓必须还能退出来
+    flat = decision_tools.evaluate(ctx, "ETH/USDT", 0.0, PLAN)
+    assert flat["ok"] and flat["target_qty"] == 0.0, flat
+    ctx.conn.close()
+
+
+# ── 默认退路：LLM 省略 exit_plan 时框架套上（§5.3 / §9.4）────
+
+
+def test_default_exit_plan_is_applied_when_omitted():
+    """省略 exit_plan -> 套用策略的默认退路；ATR 由框架自算（无需先调 get_indicators）。"""
+    src = ListCandleSource({SYM: _bars()}, tf="1h")          # ATR14 = 200
+    ctx = make_ctx(candles=src, default_exit_plan={
+        "stop_loss": {"type": "atr", "value": 1.0},
+        "take_profit": {"type": "atr", "value": 2.0}})
+
+    v = decision_tools.evaluate(ctx, SYM, 0.5, None)          # exit_plan 整个省略
+
+    assert v["ok"], v["reason"]
+    assert abs(v["atr"] - 200.0) < 1e-6, v["atr"]
+    assert abs(v["plan"]["stop_loss"] - (MARK - 200.0)) < 1e-6, v["plan"]
+    assert abs(v["plan"]["take_profit"] - (MARK + 400.0)) < 1e-6, v["plan"]
+    # 框架自算的 ATR 要记进快照：复盘时"止损为什么在这个位置"才查得出来
+    assert ctx.snapshot[SYM]["atr14"] == 200.0
+    ctx.conn.close()
+
+
+def test_no_default_exit_plan_means_exit_plan_is_mandatory():
+    """没配默认退路 + 省略 exit_plan -> 拒。默认值是兜底，不是可有可无。"""
+    ctx = make_ctx()
+    v = decision_tools.evaluate(ctx, SYM, 0.5, None)
+    assert not v["ok"] and "没有配 default_exit_plan" in v["reason"], v
+    ctx.conn.close()
+
+
+# ── 止损距离下限：太近 = 开仓即被打掉（§9.4）────────────────
+
+
+def test_stop_distance_below_floor_is_rejected():
+    """0.2% 的止损低于 0.4% 的下限 —— 这个距离里全是噪声，还会白付手续费。"""
+    ctx = make_ctx(cfg=Config(stop_distance_min_pct=0.004))
+    too_tight = {"stop_loss": {"type": "pct", "value": 0.002},
+                 "take_profit": {"type": "pct", "value": 0.02}}
+    v = decision_tools.evaluate(ctx, SYM, 0.5, too_tight)
+    assert not v["ok"] and "太近" in v["reason"], v
+
+    # 放到 0.5%（= 下限之上）就放行
+    ok_plan = {"stop_loss": {"type": "pct", "value": 0.005},
+               "take_profit": {"type": "pct", "value": 0.02}}
+    assert decision_tools.evaluate(ctx, SYM, 0.5, ok_plan)["ok"], "低于下限才拒，之上不该拦"
+    ctx.conn.close()
+
+
+# ── 风险偏好 per-agent：写了的生效，没写的回落全局 ────────────
+
+
+def test_risk_cfg_overrides_global_and_falls_back():
+    spec = agents.AgentSpec.from_dict({
+        "agent_id": "x", "name": "激进者", "persona": "p", "universe": ["BTC/USDT"],
+        "max_loss_per_trade_pct": 0.05, "stop_distance_min_pct": 0.004})
+
+    cfg = spec.risk_cfg()
+    assert cfg.max_loss_per_trade_pct == 0.05, "写了的必须生效"
+    assert cfg.stop_distance_min_pct == 0.004
+    # 没写的回落全局默认，老配置不用改
+    assert cfg.max_drawdown_halt == DEFAULT.max_drawdown_halt
+    assert cfg.cooldown_after_stop == DEFAULT.cooldown_after_stop
+    assert cfg.stop_distance_max_pct == DEFAULT.stop_distance_max_pct
+
+    # 一个风控字段都没写 -> 原样返回全局那一份（不产生多余副本）
+    bare = agents.AgentSpec.from_dict(
+        {"agent_id": "y", "name": "裸配置", "persona": "p", "universe": []})
+    assert bare.risk_cfg() is DEFAULT
+    # 全局配置本身不被污染
+    assert DEFAULT.max_loss_per_trade_pct == 0.02
+
+
+def test_default_exit_plan_must_be_an_object():
+    import pytest
+    with pytest.raises(ValueError, match="default_exit_plan"):
+        agents.AgentSpec.from_dict({"agent_id": "z", "name": "n", "persona": "p",
+                                    "universe": [], "default_exit_plan": "2xATR"})
 
 
 # ── 指令出口：落库 + 覆盖语义 ────────────────────────────────

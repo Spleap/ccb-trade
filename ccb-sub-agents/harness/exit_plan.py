@@ -130,7 +130,7 @@ def validate(plan: dict, side: int, entry_price: float,
              cfg: Config = DEFAULT, leverage: float = 1.0) -> tuple[bool, str | None]:
     """返回 (ok, reason)。不 ok 时 reason 会写进 agent_decisions.result。
 
-    这里只管**退路本身合不合规**（有没有、方向对不对、离得多远）。
+    这里只管**退路本身合不合规**（有没有、方向对不对、距离落在不在允许区间里）。
     "这一笔最多亏多少"是另一回事，由 `tools/decision.py` 的 ⑤ 用本函数返回的
     止损价去算 —— 那需要知道仓位大小，而本函数看不到。
     """
@@ -144,6 +144,13 @@ def validate(plan: dict, side: int, entry_price: float,
     if dist > abs(entry_price) * cfg.stop_distance_max_pct:
         return False, (f"止损距离 {dist:.6g} 超过上限 "
                        f"{cfg.stop_distance_max_pct:.0%} × 开仓价 {entry_price:.6g}")
+    # ★ 下限：止损太近 = 开仓即被打掉。1h 尺度上 0.05% 的止损不是风控，是噪声，
+    # 而且每一笔进出都要付手续费 —— 这种单子做十次亏十次。区间由策略配置定（§9.4）。
+    min_dist = abs(entry_price) * cfg.stop_distance_min_pct
+    if min_dist > 0 and dist < min_dist:
+        return False, (f"止损距离 {dist:.6g} 太近，低于下限 "
+                       f"{cfg.stop_distance_min_pct:.2%} × 开仓价 = {min_dist:.6g}"
+                       f"（这个距离里全是噪声，开仓就会被无意义地打掉）")
 
     if side > 0 and stop >= entry_price:
         return False, "做多的止损必须低于开仓价"

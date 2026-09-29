@@ -31,8 +31,18 @@ class Config:
 
     # ── 风控（§9.4）─────────────────────────────────────
     # 三档兜底，从紧到松：单笔亏损 → 止损与强平的距离 → 账户累计回撤。
-    cooldown_after_stop: int = 1800     # 止损后同方向冷却 30min
-    stop_distance_max_pct: float = 0.5  # 止损距离上限，防"名义上设了但形同虚设"
+    # 注意：本节里除"强平阈值"外，都是**可以被 agents/*.json 按策略覆盖**的默认值
+    # （见 `agents.AgentSpec.risk_cfg`）—— 风险偏好是策略画像的一部分，
+    # 全局值只是"没写时的兜底"。强平阈值是交易所口径，不随策略变，所以不开放覆盖。
+    #
+    # 冷却期必须 ≥ 一个唤醒周期，否则它在下一轮唤醒前就过期了，等于没有 ——
+    # 与之配套的 agent 是 4h 唤醒，所以这里取 4h。
+    cooldown_after_stop: int = 14400    # 止损后同方向冷却 4h（= 一个唤醒周期）
+    # 止损距离的允许区间。上限防"名义上设了但形同虚设"；
+    # 下限防"止损紧到只是噪声"—— 1h 尺度上给一个 0.05% 的止损，等于开仓即被打掉，
+    # 而每一笔还要付手续费。0 = 不限（老配置行为不变）。
+    stop_distance_min_pct: float = 0.0
+    stop_distance_max_pct: float = 0.5
     max_loss_per_trade_pct: float = 0.02   # ★ 单笔最多亏权益的 2%
     max_drawdown_halt: float = 0.30        # ★ 权益累计回撤 30% -> 只许减仓，不许加风险
 
@@ -42,6 +52,13 @@ class Config:
     # 强平阈值按**名义**算（与真实交易所一致）：权益 ≤ Σ|名义| × 该比例 即强平。
     # 0.005 对应 10x 约 9.5% 的不利波动、20x 约 4.5%。
     maintenance_margin_rate: float = 0.005
+
+    # ── 信息新鲜度（§2.2 单源故障不传染）──────────────────
+    # 一个采集源超过这么久没成功过，读工具就不再报"没有新闻"，而报"该源已停摆"。
+    # **"事故"和"平静"必须是两条不同的信息** —— 混在一起，LLM 会把采集中断
+    # 读成"今天很安静"然后放心下单。6h 对分钟级的源（新闻 3~5min、社媒 10~15min、
+    # 情绪指数 1h、预测市场 5min）足够宽松，不会误报。
+    info_stale_seconds: int = 21600
 
     # ── 唤醒 ────────────────────────────────────────────
     default_wake_interval: int = 3600
@@ -76,3 +93,18 @@ class Config:
 
 
 DEFAULT = Config()
+
+# 读信息工具 -> 它依赖的采集源（info-feeds/info_feeds/collector/sources.py 的 SOURCES）。
+# 只用于"停摆"判定：读回空时，靠它区分"源断了"和"真的没事发生"。
+# 空元组 = 这张表还没有采集源接入 —— 那样读工具会如实说"尚未接入采集"，
+# 而不是伪装成"没有事件"。
+#
+# 宏观（`get_macro`）刻意不在表里：FRED 是月度经济数据，源每 12h 才跑一轮，
+# 用小时级阈值判它必然误报，而"这个月的 CPI 还没更新"本来就不是风险。
+INFO_SOURCES: dict[str, tuple[str, ...]] = {
+    "news": ("cryptocurrency_cv", "google_news", "google_news_global"),
+    "sentiment": ("reddit", "stocktwits"),
+    "sentiment_index": ("fear_greed",),
+    "prediction": ("polymarket",),
+    "events": (),                      # 交易所公告还没有采集源接入
+}

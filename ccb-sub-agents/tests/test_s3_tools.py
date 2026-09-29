@@ -78,12 +78,49 @@ def test_failure_returns_sentinel_and_is_logged():
 
 
 def test_empty_result_is_not_a_failure():
-    """「过去 24h 没新闻」是有效信息，不是数据源故障。混为一谈会让系统放弃本 tick。"""
+    """「过去 24h 没新闻」是有效信息，不是数据源故障 —— 前提是采集源本身是活的。"""
     ctx = make_ctx()
+    _seed_health(ctx.conn, "google_news", T0 - 60)      # 源健康 -> 空就是真的空
     out = data_tools.get_news(ctx, lookback_hours=24)
     assert not tools.is_unavailable(out), out
     assert "无数据" in out
     assert ctx.failures() == []
+    ctx.conn.close()
+
+
+def test_dead_source_is_not_reported_as_quiet():
+    """采集中断 ≠ 今天很平静 —— 这两句必须长得完全不一样（§2.2）。
+
+    这是最危险的一种静默失败：源停了三天，LLM 读到"没有新闻"，
+    会把它解释成"市场很安静"然后放心下单。
+    """
+    ctx = make_ctx()
+    for name in ("cryptocurrency_cv", "google_news", "google_news_global"):
+        _seed_health(ctx.conn, name, T0 - 24 * 3600)    # 一整天没成功过
+    out = data_tools.get_news(ctx, lookback_hours=24)
+
+    assert "数据源停摆" in out, out
+    assert "无数据" not in out, "停摆不能被说成'无数据'，那是两种相反的事实"
+    assert not tools.is_unavailable(out), "这不是取数失败，是数据不可信 —— 三者互不相同"
+    ctx.conn.close()
+
+
+def test_partially_dead_source_is_not_declared_down():
+    """三个新闻源里活了一个，就不能断言'数据断了' —— 空更可能是这轮确实没事。"""
+    ctx = make_ctx()
+    _seed_health(ctx.conn, "google_news", T0 - 60)
+    _seed_health(ctx.conn, "cryptocurrency_cv", T0 - 24 * 3600)
+
+    out = data_tools.get_news(ctx, lookback_hours=24)
+    assert "数据源停摆" not in out and "无数据" in out, out
+    ctx.conn.close()
+
+
+def test_table_without_a_collector_says_so():
+    """交易所公告还没有采集源 —— 必须如实说'尚未接入'，不许假装'没有事件'。"""
+    ctx = make_ctx()
+    out = data_tools.get_market_events(ctx)
+    assert "尚未接入采集" in out and "无数据" not in out, out
     ctx.conn.close()
 
 
@@ -289,14 +326,39 @@ def test_tool_spec_is_valid_json_schema():
     names = spec["get_indicators"]["parameters"]["properties"]["names"]
     assert names["type"] == "array" and names["items"]["type"] == "string"
 
-    # 嵌套对象（exit_plan）与简写可以混用
+    # 嵌套对象（exit_plan）与简写可以混用。
+    # exit_plan 本身**不在 required 里**：可省略，省略即用策略的 default_exit_plan。
     entry = spec["propose_target"]["parameters"]
     assert entry["properties"]["exit_plan"]["type"] == "object"
     assert entry["properties"]["exit_plan"]["required"] == ["stop_loss", "take_profit"]
-    assert "exit_plan" in entry["required"]
-    assert entry["required"] == ["symbol", "ratio", "reason", "exit_plan"]
+    assert "exit_plan" not in entry["required"]
+    assert entry["required"] == ["symbol", "ratio", "reason"]
+
+    # 改止损必须给新计划，所以它那支是必填
+    assert "exit_plan" in spec["amend_exit_plan"]["parameters"]["required"]
 
     assert "cancel_exit_plan" not in spec, "这个能力就不该存在（§9.4）"
+
+
+def test_bitget_symbol_covers_mainstream_non_crypto():
+    """品种池要能放美股/指数/黄金/外汇 —— 它们的 Bitget 符号命名不规律，必须逐条对上。"""
+    from harness.tools.candles import bitget_symbol as b
+
+    # 加密：三种写法都要落到同一个永续符号
+    assert b("BTC/USDT") == b("BTC-USD") == b("BTC") == "BTCUSDT"
+    assert b("ETH-USDT") == "ETHUSDT"
+
+    # 美股/指数/贵金属：按 `X/USDT` 写就命中
+    assert b("AAPL/USDT") == "AAPLUSDT"
+    assert b("NVDA") == "NVDAUSDT"
+    assert b("SPX/USDT") == "SPXUSDT"
+    assert b("NDX100/USDT") == "NDX100USDT"
+    assert b("XAU/USDT") == "XAUUSDT"
+
+    # 这几个是通用规则会算错的：`EUR/USD` 会被补成并不存在的 `EURUSDT`
+    assert b("EUR/USD") == b("EURUSD") == "EURUSDUSDT"
+    assert b("GBP/USD") == "GBPUSDUSDT"
+    assert b("XAUUSD") == b("GOLD") == "XAUUSDT"
 
 
 # ── 内部：灌数据 ────────────────────────────────────────────
@@ -310,6 +372,15 @@ def _seed_news(conn, n: int, ts: int | None = None, prefix: str = "窗口内") -
             (f"{prefix}-{i}", (ts if ts is not None else T0 - 60 - i), f"{prefix}标题 {i}",
              '["BTC/USDT"]'),
         )
+
+
+def _seed_health(conn, source: str, last_ok_ts: int | None) -> None:
+    """灌一行采集源健康度 —— 决定读工具把"空"解释成"平静"还是"停摆"。"""
+    conn.execute(
+        "INSERT INTO source_health (source, last_ok_ts, consecutive_failures) VALUES (?, ?, 0) "
+        "ON CONFLICT(source) DO UPDATE SET last_ok_ts = excluded.last_ok_ts",
+        (source, last_ok_ts),
+    )
 
 
 if __name__ == "__main__":

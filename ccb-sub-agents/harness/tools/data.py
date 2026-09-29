@@ -9,11 +9,16 @@
   * 所有返回值都带长度上限，且 `limit` 由服务端再夹一次（§4.2 第 3 条）
   * 读到行情数字顺手 `ctx.record(...)`，⑦ Journal 落成快照（§2.4）
 
-一个刻意的区分
+一个刻意的三分
 --------------
-**"没数据"不是"失败"。** "过去 24h 没有新闻"是有效信息，返回一句人话；
-只有真正拿不到（无数据源、查询出错）才返回 `DATA_UNAVAILABLE:` 哨兵。
-两者混为一谈，系统会把"今天很平静"误判成"数据源挂了"，进而放弃本 tick（§3.5）。
+读信息类工具（push 层）的返回有**三种**，不能混：
+
+1. `DATA_UNAVAILABLE:` —— 取数失败，是**事故**。
+2. `（无数据：…）` —— 源是健康的，那段时间确实什么都没发生，是**事实**。
+3. `（数据源停摆 / 尚未接入采集 …）` —— **这条信息不可信**：不是"很平静"，是"数据断了"。
+
+第 2、3 种混为一谈最危险：LLM 会把"采集进程死了三天"读成"市场很安静"，
+然后在一个它看不见的世界里放心下单。判定靠 `source_health`（见 `_stale_note`）。
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ import datetime as dt
 import json
 import re
 
+from harness.config import INFO_SOURCES
 from harness.store import repo
 from harness.tools import derivatives, indicators
 from harness.tools.base import Tool, ToolContext, unavailable
@@ -30,20 +36,88 @@ def _utc(ts: int) -> str:
     return dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+# 主流非加密品种：交易口径 -> 信息层（Yahoo）口径。
+#
+# 为什么只能列出来：Bitget 的美股/指数合约和加密是**同一套 USDT 计价符号**
+# （`AAPLUSDT`），纯从符号上分不出"这是股票还是币"；而 Yahoo 那边美股就是裸代码
+# `AAPL`，黄金是 COMEX 期货 `GC=F`，指数是 `^` 开头。规则推不出来，只能显式列。
+#
+# 覆盖范围是刻意的：列到的是主流品种。没列到的非加密品种**量价照常**（走 Bitget），
+# 但新闻/情绪会查回空 —— 而"查回空"会被 LLM 当成"今天很平静"（§3.5），
+# 所以宁可在这里显式列出来，也不要让它悄悄退化成"没有消息"。
+_INFO_ALIASES = {
+    # 美股 / ETF（Yahoo 就用裸代码）
+    "AAPL": "AAPL", "NVDA": "NVDA", "TSLA": "TSLA", "MSFT": "MSFT",
+    "META": "META", "GOOGL": "GOOGL", "AMZN": "AMZN", "NFLX": "NFLX",
+    "AMD": "AMD", "INTC": "INTC", "COIN": "COIN", "MSTR": "MSTR",
+    # 指数
+    "SPX": "^GSPC", "SPX500": "^GSPC", "US500": "^GSPC",
+    "NDX": "^NDX", "NDX100": "^NDX", "NAS100": "^NDX",
+    "HSI": "^HSI", "HK50": "^HSI",
+    # 贵金属（Yahoo 上黄金/白银是 COMEX 期货）
+    "XAU": "GC=F", "GOLD": "GC=F", "XAG": "SI=F", "SILVER": "SI=F",
+    # 外汇
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
+}
+
+
 def _info_symbol(symbol: str) -> str:
-    """把交易口径的符号翻成**信息层口径**：`BTC/USDT` / `BTC-USD` -> `BTC-USD`。
+    """把交易口径的符号翻成**信息层口径**（Yahoo）。
+
+        BTC/USDT -> BTC-USD      AAPL/USDT -> AAPL
+        XAU/USDT -> GC=F         SPX/USDT  -> ^GSPC
 
     agent 的 universe 是交易口径（`BTC/USDT`，给交易所用），而 info-feeds 存的
-    symbols 是 Yahoo 风格的 `BTC-USD`。两边不翻一下，`get_news` 的 LIKE 与
-    `get_sentiment` 的精确匹配都会读回空 —— 而"读回空"会被 LLM 当成"今天很平静"。
-    只对加密基础币做映射；非加密的陌生符号原样返回。
+    symbols 是 Yahoo 风格。两边不翻一下，`get_news` 的 LIKE 与 `get_sentiment`
+    的精确匹配都会读回空 —— 而"读回空"会被 LLM 当成"今天很平静"。
+    表里没列到的按加密对处理（Yahoo 只有 `<BASE>-USD`）。
     """
-    base = re.match(r"[A-Za-z]+", symbol.strip())
-    return f"{base.group(0).upper()}-USD" if base else symbol
+    match = re.match(r"[A-Za-z]+", symbol.strip())
+    if not match:
+        return symbol
+    base = match.group(0).upper()
+    return _INFO_ALIASES.get(base) or f"{base}-USD"
 
 
 def _empty(what: str) -> str:
     return f"（无数据：{what}）"
+
+
+def _stale_note(ctx: ToolContext, group: str) -> str | None:
+    """读回空时用：区分「源停摆 / 尚未接入」与「真的没事发生」（§2.2 / §3.5）。
+
+    返回一句人话（要贴在返回里），或 None（= 源是健康的，空就是真的空）。
+
+    为什么必须有这一层：`news_items` 查回空有两种完全相反的含义 ——
+    世界很安静，或者采集进程早就死了。**只给 LLM 看"没有数据"，
+    它一定会选前者**（那是它最舒服的解释），然后在一个数据断了的环境里放心下单。
+    """
+    sources = INFO_SOURCES.get(group, ())
+    if not sources:
+        return (f"（**尚未接入采集**：`{group}` 这类信息目前没有数据源 —— "
+                f"拿不到不等于没发生，别把它读成「一切正常」，更别据此加仓）")
+
+    health = repo.source_health(ctx.conn)
+    down: list[str] = []
+    for name in sources:
+        row = health.get(name)
+        last_ok = row.get("last_ok_ts") if row else None
+        if not last_ok:
+            down.append(f"{name}（从未成功采集）")
+            continue
+        age = ctx.as_of - int(last_ok)
+        if age > ctx.cfg.info_stale_seconds:
+            down.append(f"{name}（已 {age / 3600:.1f}h 未成功）")
+
+    # 只要还有一个源是活的，就不能断言"整块数据断了" —— 空更可能是这轮确实没事。
+    if len(down) < len(sources):
+        return None
+    return (f"（**数据源停摆**：{'、'.join(down)} —— 这不是「今天很平静」，是「数据断了」。"
+            f"本条信息不可信：不要拿「没看到坏消息」当利好，要动手只能用你自己能验证的 K 线）")
+
+
+def _with_note(body: str, note: str | None) -> str:
+    return f"{body}\n{note}" if note else body
 
 
 def _limit(value, default: int, hard: int = 200) -> int:
@@ -126,9 +200,10 @@ def get_news(ctx: ToolContext, symbol: str | None = None, lookback_hours: int = 
     since = ctx.as_of - int(lookback_hours) * 3600
     syms = [_info_symbol(symbol)] if symbol else None
     rows = repo.recent_news(ctx.conn, ctx.as_of, since, syms, n)
+    note = _stale_note(ctx, "news")
     if not rows:
-        scope = symbol or "全市场"
-        return _empty(f"{scope} 在过去 {lookback_hours}h 没有新闻")
+        # 空有两种含义：世界很安静，或者采集停了。源停摆时给的是后者（§2.2）。
+        return note or _empty(f"{symbol or '全市场'} 在过去 {lookback_hours}h 没有新闻")
 
     lines = []
     for r in rows:
@@ -136,7 +211,8 @@ def get_news(ctx: ToolContext, symbol: str | None = None, lookback_hours: int = 
         lines.append(f"- [{_utc(r['ts'])}] ({r['source']}) {r['title']}"
                      + (f"  {tags}" if tags else "")
                      + (f"\n  {r['summary']}" if r.get("summary") else ""))
-    return f"新闻（最近 {len(rows)} 条，截止 {_utc(ctx.as_of)}）：\n" + "\n".join(lines)
+    return _with_note(f"新闻（最近 {len(rows)} 条，截止 {_utc(ctx.as_of)}）：\n" + "\n".join(lines),
+                      note)
 
 
 def get_global_news(ctx: ToolContext, lookback_hours: int = 24,
@@ -149,8 +225,9 @@ def get_sentiment(ctx: ToolContext, symbol: str, lookback_hours: int = 24,
     n = _limit(limit, 50, hard=200)
     since = ctx.as_of - int(lookback_hours) * 3600
     rows = repo.recent_social(ctx.conn, ctx.as_of, since, _info_symbol(symbol), n)
+    note = _stale_note(ctx, "sentiment")
     if not rows:
-        return _empty(f"{symbol} 在过去 {lookback_hours}h 没有社媒样本")
+        return note or _empty(f"{symbol} 在过去 {lookback_hours}h 没有社媒样本")
 
     bull = sum(1 for r in rows if (r["sentiment"] or "") == "Bullish")
     bear = sum(1 for r in rows if (r["sentiment"] or "") == "Bearish")
@@ -160,22 +237,24 @@ def get_sentiment(ctx: ToolContext, symbol: str, lookback_hours: int = 24,
 
     samples = "\n".join(f"- ({(r['sentiment'] or 'n/a')[:4]}) {(r['text'] or '')[:120]}"
                         for r in rows[:5])
-    return (f"{symbol} 社媒（过去 {lookback_hours}h，样本 {len(rows)}）："
-            f"看多 {bull} / 看空 {bear} / 其余 {len(rows) - bull - bear}，互动量 {engagement}\n"
-            f"最近样本：\n{samples}")
+    return _with_note(
+        f"{symbol} 社媒（过去 {lookback_hours}h，样本 {len(rows)}）："
+        f"看多 {bull} / 看空 {bear} / 其余 {len(rows) - bull - bear}，互动量 {engagement}\n"
+        f"最近样本：\n{samples}", note)
 
 
 def get_sentiment_index(ctx: ToolContext, name: str = "fear_greed",
                         limit: int | None = None) -> str:
     n = _limit(limit, 30, hard=180)
     rows = repo.recent_sentiment_index(ctx.conn, name, ctx.as_of, n)
+    note = _stale_note(ctx, "sentiment_index")
     if not rows:
-        return _empty(f"没有 {name} 的历史值")
+        return note or _empty(f"没有 {name} 的历史值")
 
     ctx.record(f"index:{name}", sentiment_index=rows[-1]["value"],
                sentiment_index_ts=rows[-1]["ts"])
     series = ", ".join(f"{_utc(r['ts'])[5:10]}:{r['value']:.4g}" for r in rows)
-    return f"{name}（最新 {rows[-1]['value']:.4g}，共 {len(rows)} 期）\n{series}"
+    return _with_note(f"{name}（最新 {rows[-1]['value']:.4g}，共 {len(rows)} 期）\n{series}", note)
 
 
 def get_market_events(ctx: ToolContext, symbols=None, lookback_hours: int = 72,
@@ -184,26 +263,28 @@ def get_market_events(ctx: ToolContext, symbols=None, lookback_hours: int = 72,
     syms = [_info_symbol(s) for s in _as_list(symbols, [])]
     since = ctx.as_of - int(lookback_hours) * 3600
     rows = repo.recent_events(ctx.conn, ctx.as_of, since, syms or None, n)
+    note = _stale_note(ctx, "events")
     if not rows:
-        scope = "/".join(syms) if syms else "全市场"
-        return _empty(f"{scope} 在过去 {lookback_hours}h 没有公告事件")
+        return note or _empty(
+            f"{'/'.join(syms) if syms else '全市场'} 在过去 {lookback_hours}h 没有公告事件")
 
     lines = [f"- [{_utc(r['ts'])}] {r['kind']}: {r['title']}" for r in rows]
-    return (f"交易所公告（最近 {len(rows)} 条，截止 {_utc(ctx.as_of)}）：\n" + "\n".join(lines))
+    return f"交易所公告（最近 {len(rows)} 条，截止 {_utc(ctx.as_of)}）：\n" + "\n".join(lines)
 
 
 def get_prediction_market(ctx: ToolContext, topic: str, limit: int | None = None) -> str:
     n = _limit(limit, 50, hard=200)
     rows = repo.recent_prediction(ctx.conn, topic, ctx.as_of, n)
+    note = _stale_note(ctx, "prediction")
     if not rows:
-        return _empty(f"没有和 {topic!r} 相关的预测市场报价")
+        return note or _empty(f"没有和 {topic!r} 相关的预测市场报价")
 
     latest: dict[str, dict] = {}                     # 降序返回，首次出现即最新
     for r in rows:
         latest.setdefault(r["outcome"], r)
     ctx.record(f"prediction:{topic}", **{f"p_{o}": v["prob"] for o, v in latest.items()})
     lines = [f"- {outcome}: {r['prob']:.4g}（{_utc(r['ts'])}）" for outcome, r in latest.items()]
-    return f"预测市场 {topic}（{len(latest)} 个结果）：\n" + "\n".join(lines)
+    return _with_note(f"预测市场 {topic}（{len(latest)} 个结果）：\n" + "\n".join(lines), note)
 
 
 def get_macro(ctx: ToolContext, series_id: str, limit: int | None = None) -> str:

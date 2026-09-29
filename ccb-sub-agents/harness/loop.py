@@ -117,6 +117,10 @@ def run_once(conn, agent_id: str, clock, *, llm: LLMClient,
         _emit(on_event, "degraded", reason=why)
         return degrade(conn, agent_id, now, decision_id, why)
 
+    # ★ 风险偏好是**每个策略自己写**的（§9.4）：把本 Agent 的画像盖到全局配置上，
+    # 之后这一 tick 里所有下游（⑤ 校验、止损扫描、提示词渲染）都只认这一份 cfg。
+    cfg = spec.risk_cfg(cfg)
+
     if mark is None:
         if candles is None:
             raise ValueError("必须提供 mark 或 candles 之一：没有价格来源就只能瞎猜，"
@@ -133,7 +137,8 @@ def run_once(conn, agent_id: str, clock, *, llm: LLMClient,
     ctx = ToolContext(conn=conn, agent_id=agent_id, as_of=now, candles=candles, cfg=cfg,
                       tf=spec.tf, mark=mark, budget=repo.get_budget(conn, agent_id),
                       equity=mtm["equity"], starting_equity=spec.starting_equity,
-                      leverage=spec.leverage)
+                      leverage=spec.leverage, universe=spec.universe,
+                      default_exit_plan=spec.default_exit_plan)
 
     # 记忆注入（§8.4 push 路径）。指纹只用于"这条记忆是不是来自另一个市场状态"，
     # 所以它算出来的 ATR **不进决策快照** —— 快照的语义是"LLM 当时真的看到了什么"。

@@ -18,10 +18,38 @@ from typing import Any
 from harness import exit_plan as plans
 from harness.paper import fees, ledger
 from harness.store import repo
+from harness.tools import indicators
 from harness.tools.base import Tool, ToolContext
 from harness.tools.candles import TF_SECONDS
 
 _EPS = 1e-9
+
+
+def _atr_for_exit(ctx: ToolContext, symbol: str) -> float | None:
+    """退路要用的 ATR。
+
+    优先用**它这轮真的看到的**那个（快照里的）；没看到就自己从 K 线算 ——
+    默认退路是框架的机械兜底，不该反过来要求 LLM 先调一次 `get_indicators`。
+
+    自己算出来的那一份**也记进快照**：这笔仓位的止损价就是由这个 ATR 推出来的，
+    复盘时它必须在场，否则"止损为什么在这个位置"就查不出来了（§2.4）。
+    """
+    seen = (ctx.snapshot.get(symbol) or {}).get("atr14")
+    if seen:
+        return float(seen)
+    if ctx.candles is None:
+        return None
+    try:
+        bars = ctx.candles.fetch(symbol, ctx.tf, 200, ctx.as_of)
+    except Exception:
+        return None
+    if not bars:
+        return None
+    value = indicators.compute(["atr14"], bars).get("atr14")
+    if value is None:
+        return None
+    ctx.record(symbol, atr14=float(value), atr14_from="framework")
+    return float(value)
 
 
 # ============================================================
@@ -35,6 +63,9 @@ def evaluate(ctx: ToolContext, symbol: str, ratio: Any, exit_plan_spec: dict | N
     共用不是图省事：**如果 LLM 自我试算的口径和 harness 的裁决口径不一致，
     提示词里写再好的"请自行检查"都是假的。**
     """
+    # 没给退路就用本策略的**默认退路**（创建时写在配置里）。
+    # 给了就以它为准 —— 默认值是兜底，不是天花板（§5.3）。
+    exit_plan_spec = exit_plan_spec or ctx.default_exit_plan
     out: dict = {
         "ok": False, "reason": None, "symbol": symbol, "ratio": None, "mark": None,
         "side": 0, "target_qty": 0.0, "delta_qty": 0.0, "notional": 0.0,
@@ -63,6 +94,14 @@ def evaluate(ctx: ToolContext, symbol: str, ratio: Any, exit_plan_spec: dict | N
     if ratio == 0.0:                                   # 清仓：不需要 exit_plan
         out.update(ok=True, side=0, target_qty=0.0, delta_qty=-cur_qty)
         return out
+
+    # 品种池同样是**创建时就定好**的（§5.3）：池子外的品种一律不许碰，
+    # 提示词里写着不算数，得在这里拦下来。清仓（上面那条）永远放行 ——
+    # 品种池是被改小的，旧持仓必须还能退出来。
+    if ctx.universe and symbol not in ctx.universe:
+        return {**out, "reason": (
+            f"{symbol} 不在你的品种池内（可交易：{'、'.join(ctx.universe)}）—— "
+            f"品种池在创建时就定好了，不能自行扩展；想清掉池外的旧持仓用 ratio=0")}
 
     side = 1 if ratio > 0 else -1
     out["side"] = side
@@ -108,12 +147,12 @@ def evaluate(ctx: ToolContext, symbol: str, ratio: Any, exit_plan_spec: dict | N
         if repo.is_cooling_down(ctx.conn, ctx.agent_id, ctx.as_of):
             return {**out, "reason": "止损冷却期内禁止加大敞口（防报复性交易，§9.4）"}
 
-    # —— 到这里意味着"要产生成交"，那么 exit_plan 必填（§9.4）——
+    # —— 到这里意味着"要产生成交"，那么必须有退路（§9.4）——
     if not exit_plan_spec:
-        return {**out, "reason": "缺少 exit_plan：做交易就必须在开仓那一刻写好退路（§9.4）"}
+        return {**out, "reason": ("缺少 exit_plan，且本策略没有配 default_exit_plan："
+                                  "做交易就必须在开仓那一刻写好退路（§9.4）")}
 
-    # ATR 取"它这次真正看到的值"（快照里的），这样计划与它对行情的认知一致
-    atr = (ctx.snapshot.get(symbol) or {}).get("atr14")
+    atr = _atr_for_exit(ctx, symbol)
     out["atr"] = atr
 
     try:
@@ -278,7 +317,7 @@ def amend_exit_plan(ctx: ToolContext, symbol: str, exit_plan: dict) -> str:
         return f"rejected: {symbol} 当前没有 exit_plan，无法修改（请先减仓再重新提案）"
 
     side = 1 if float(pos["qty"]) > 0 else -1
-    atr = (ctx.snapshot.get(symbol) or {}).get("atr14")
+    atr = _atr_for_exit(ctx, symbol)
     try:
         new = plans.amend(old, exit_plan, side, float(pos["avg_price"]),
                           atr=atr, bar_seconds=TF_SECONDS.get(ctx.tf))
@@ -321,14 +360,27 @@ _EXIT_PLAN_SCHEMA: dict = {
     "required": ["stop_loss", "take_profit"],
 }
 
+# propose_target / precheck 用的变体：**可以整个省略** —— 省略即套用本策略的默认退路。
+# 多一个 `default` 键是为了让它不进 JSON Schema 的 `required`：
+# `base.to_json_schema` 的判据是"有默认值的参数不该进 required"。
+_EXIT_PLAN_OPTIONAL: dict = {
+    **_EXIT_PLAN_SCHEMA,
+    "description": "退路。**可以整个省略** —— 省略时框架套用你所属策略的 default_exit_plan"
+                   "（见系统提示词的「你的环境」一节）。自己给就必须止盈与止损同时给。"
+                   '例：{"stop_loss":{"type":"atr","value":2.0},'
+                   '"take_profit":{"type":"atr","value":4.0}}',
+    "default": {},
+}
+
 DECISION_TOOLS: list[Tool] = [
-    Tool("propose_target", "提交目标占比（唯一写操作）。ratio ∈ [-1,1]，+多 / -空 / 0 清仓",
-         {"symbol": "str", "ratio": "float", "reason": "str", "exit_plan": _EXIT_PLAN_SCHEMA},
+    Tool("propose_target", "提交目标占比（唯一写操作）。ratio ∈ [-1,1]，+多 / -空 / 0 清仓。"
+         "exit_plan 可省略（省略即用本策略的默认退路）",
+         {"symbol": "str", "ratio": "float", "reason": "str", "exit_plan": _EXIT_PLAN_OPTIONAL},
          propose_target),
     Tool("get_exit_plan", "读自己某持仓当前的止盈止损",
          {"symbol": "str"}, get_exit_plan),
     Tool("amend_exit_plan", "收紧某持仓的止盈止损。**只能收紧，不能放宽**",
          {"symbol": "str", "exit_plan": _EXIT_PLAN_SCHEMA}, amend_exit_plan),
     Tool("precheck", "试算一次提案会不会被拒，不产生任何后果",
-         {"symbol": "str", "ratio": "float", "exit_plan": _EXIT_PLAN_SCHEMA}, precheck),
+         {"symbol": "str", "ratio": "float", "exit_plan": _EXIT_PLAN_OPTIONAL}, precheck),
 ]

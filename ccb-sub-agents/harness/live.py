@@ -112,6 +112,12 @@ def banner(specs: Iterable[agents.AgentSpec], cfg: Config, llm_desc: str,
     for s in specs:
         printer(f"  [{s.agent_id}] {s.name}  品种={'/'.join(s.universe)}  "
                 f"周期={s.tf}  唤醒={s.wake_interval}s  起始权益={s.starting_equity:.0f}U")
+        rc = s.risk_cfg(cfg)
+        printer(f"      风险画像：杠杆={s.leverage:g}x  单笔≤{rc.max_loss_per_trade_pct:.1%}  "
+                f"熔断={rc.max_drawdown_halt:.0%}  "
+                f"止损距离={rc.stop_distance_min_pct:.2%}~{rc.stop_distance_max_pct:.0%}  "
+                f"冷却={rc.cooldown_after_stop}s")
+        printer(f"      默认退路：{json.dumps(s.default_exit_plan, ensure_ascii=False) if s.default_exit_plan else '（未配 → exit_plan 必须自己给）'}")
     printer("=" * 72)
 
 
@@ -138,6 +144,8 @@ def run(conn, *, specs: Iterable[agents.AgentSpec], llm: LLMClient, candles,
 
     # watchdog 的强平判定要按 agent 各自的杠杆来（杠杆 > 1 才启用）
     leverage_by_agent = {s.agent_id: s.leverage for s in specs}
+    # 风险偏好也是按 agent 各写一份的 —— 冷却时长尤其，它必须跟自己的唤醒节奏匹配
+    cfg_by_agent = {s.agent_id: s.risk_cfg(cfg) for s in specs}
 
     def price(symbol: str, ts: int) -> float | None:
         try:
@@ -157,7 +165,8 @@ def run(conn, *, specs: Iterable[agents.AgentSpec], llm: LLMClient, candles,
                 last_watchdog = now
                 with conn:
                     closed = watchdog.run_once(conn, clock, price, cfg,
-                                               leverage_of=leverage_by_agent.get)
+                                               leverage_of=leverage_by_agent.get,
+                                               cfg_of=cfg_by_agent.get)
                 for c in closed:
                     stats["closed"] += 1
                     printer(f"退出 {c['agent_id']} {c['symbol']}  原因={c['reason']}  "

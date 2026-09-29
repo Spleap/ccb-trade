@@ -498,6 +498,18 @@ def recent_prediction(conn, topic: str, as_of: int, limit: int = 50) -> list[dic
     return [dict(r) for r in rows]
 
 
+def source_health(conn) -> dict[str, dict]:
+    """各采集源的健康度（info-feeds 写、harness 只读）。
+
+    读它是为了把"采集中断"和"真的没事发生"分开：`news_items` 空可能是世界很安静，
+    也可能是采集进程早就停了 —— 只看表本身，这两件事长得一模一样（§2.2）。
+    """
+    rows = conn.execute(
+        "SELECT source, last_ok_ts, consecutive_failures, last_error FROM source_health"
+    )
+    return {r["source"]: dict(r) for r in rows}
+
+
 # ============================================================
 # 内部工具
 # ============================================================

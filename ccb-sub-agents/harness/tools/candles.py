@@ -70,17 +70,49 @@ _BITGET_INTERVAL = {
 _MAX_BARS_PER_REQUEST = 1000
 
 
-def bitget_symbol(symbol: str) -> str:
-    """把 agent 口径的符号翻成 Bitget 口径：`BTC/USDT` / `BTC-USD` / `BTC` -> `BTCUSDT`。
+# 非加密品种的显式别名（agent 口径 -> Bitget 符号）。
+#
+# 为什么必须有这张表：Bitget 的永续命名**不一致** —— 黄金叫 `XAUUSDT`（USDT 计价），
+# 欧元叫 `EURUSDUSDT`（标的本身是 EURUSD，用 USDT 计价），两者都以 USD 结尾，
+# 靠后缀规则分不出来（`EUR/USD` 会被补成一个并不存在的 `EURUSDT`）。
+#
+# 实测 Bitget `USDT-FUTURES` 共 804 个合约，里面就有美股（`AAPLUSDT`/`NVDAUSDT`/
+# `TSLAUSDT`/`MSFTUSDT`/`METAUSDT`/`GOOGLUSDT`/`AMZNUSDT`）、指数（`SPXUSDT`/
+# `NDX100USDT`/`HSIUSDT`）、贵金属（`XAUUSDT`/`XAGUSDT`/`XAUTUSDT`）与外汇
+# （`EURUSDUSDT`/`GBPUSDUSDT`/`USDJPYUSDT`）—— **不需要额外的行情源**。
+# 表里没列到的品种走下面的通用规则：只要按 `X/USDT` 写，美股/指数都能直接命中。
+_BITGET_ALIASES = {
+    # 贵金属
+    "XAU": "XAUUSDT", "GOLD": "XAUUSDT", "XAUUSD": "XAUUSDT",
+    "XAG": "XAGUSDT", "SILVER": "XAGUSDT", "XAGUSD": "XAGUSDT",
+    # 指数
+    "SPX": "SPXUSDT", "SPX500": "SPXUSDT", "US500": "SPXUSDT",
+    "NDX": "NDX100USDT", "NDX100": "NDX100USDT", "NAS100": "NDX100USDT",
+    "HSI": "HSIUSDT", "HK50": "HSIUSDT",
+    # 外汇
+    "EURUSD": "EURUSDUSDT", "GBPUSD": "GBPUSDUSDT", "USDJPY": "USDJPYUSDT",
+}
 
-    永续合约的 `USDT-FUTURES` 与现货用同一套符号（`BTCUSDT`），所以这套映射通用。
+
+def bitget_symbol(symbol: str) -> str:
+    """把 agent 口径的符号翻成 Bitget 口径。
+
+        BTC/USDT  BTC-USD  BTC   -> BTCUSDT
+        AAPL/USDT AAPL           -> AAPLUSDT     （美股永续）
+        XAU/USDT  GOLD  XAUUSD   -> XAUUSDT      （黄金）
+        SPX/USDT  US500          -> SPXUSDT      （标普 500）
+        EUR/USD   EURUSD         -> EURUSDUSDT   （外汇）
+
+    永续与现货在 Bitget 用同一套符号（`BTCUSDT`），所以这套映射通用。
     """
     s = re.sub(r"[^A-Za-z0-9]", "", symbol).upper()
+    if s in _BITGET_ALIASES:
+        return _BITGET_ALIASES[s]
     if s.endswith("USDT") or s.endswith("USDC"):
         return s
     if s.endswith("USD"):
-        return s + "T"          # BTCUSD -> BTCUSDT
-    return s + "USDT"           # BTC -> BTCUSDT
+        return s + "T"          # BTC-USD -> BTCUSDT
+    return s + "USDT"           # BTC / AAPL / NVDA -> BTCUSDT / AAPLUSDT / NVDAUSDT
 
 
 class BitgetCandleSource:
