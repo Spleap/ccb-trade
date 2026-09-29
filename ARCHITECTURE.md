@@ -212,7 +212,10 @@ A 类的行情分两条来源：
 
 1. **返回必须有长度上限** —— 服务端强制截断，签名里的 `limit` 只是"上限的上限"。
 2. **失败返回哨兵，绝不返回空** —— `DATA_UNAVAILABLE: ...`。返回空会让 LLM **编造数据**。
-   注意区分"工具故障"与"没有数据"：后者返回一句人话，是**事实**，不是事故。
+   信息类工具的返回因此有**三种**，混不得：`DATA_UNAVAILABLE`（事故）、
+   `（无数据：…）`（事实，源是活的、那段时间确实没事）、
+   `（数据源停摆／尚未接入采集…）`（**这条信息不可信**，不是"平静"是"数据断了"）。
+   第二种与第三种混为一谈，LLM 会把采集中断读成"市场很安静"然后放心下单。
 3. **行情数值自动落快照** —— ⑦ 一次性落库（K 线可以不存，但"你当时看到了什么"必须存）。
 
 **工具集按策略裁剪**：能裁的只有 A 类。B 类（看自己）、C 类（记忆）、D 类（出口）**永远在** ——
@@ -229,13 +232,14 @@ A 类的行情分两条来源：
 | 层 | 内容 | 可变性 |
 |---|---|---|
 | **L1 身份** | persona，每个策略自己写 | 可变 |
-| **L2 环境** | 品种池 / 周期 / 预算 / 杠杆 / **风控硬线的具体数字** | 可变（由配置渲染） |
-| **L3 规则** | 不可协商的硬约束（11 条） | ★不可变 |
+| **L2 环境** | 品种池 / 周期 / 预算 / 杠杆 / **默认退路 / 止损距离区间 / 风控硬线的具体数字** | 可变（由配置渲染） |
+| **L3 规则** | 不可协商的硬约束（12 条） | ★不可变 |
 | **L4 流程** | 你的 loop 是哪七步、取数纪律 | ★不可变 |
 | **L5 输出契约** | 必须返回什么（`propose_target` 的形态） | ★不可变 |
 
-L3 的 11 条硬约束（摘）：只能通过 `propose_target` 表达意图；`ratio ∈ [-1,1]` 是**预算占比**
-不是杠杆倍数；下单必须给 `exit_plan` 且**止盈止损都要有**；止损只能收紧不能放宽；
+L3 的 12 条硬约束（摘）：只能通过 `propose_target` 表达意图；`ratio ∈ [-1,1]` 是**预算占比**
+不是杠杆倍数；下单必须有 `exit_plan`（**可省略** -> 框架套用策略的**默认退路**），
+且**止盈止损都要有**；止损只能收紧不能放宽；**只能在品种池里选**（清掉池外旧持仓用 `ratio=0`）；
 超预算会被拒；工具失败返 `DATA_UNAVAILABLE`；拿不到数据宁可不做；
 **单笔最大亏损是硬上限**（`名义 × 止损距离`）；杠杆策略的止损必须紧于强平距离；
 账户累计回撤触及熔断线后只能减仓。
@@ -362,18 +366,65 @@ LLM 走 OpenAI 兼容协议，默认 provider 是 `deepseek`（key 从环境变�
 ```json
 {
   "agent_id": "trend-scout-01",
-  "name": "阿岚 · 日内趋势侦察",
-  "persona": "你是阿岚……（人设，随便写）",
-  "universe": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"],
-  "tf": "15m",
-  "wake_interval": 28800,
-  "w": 0.5, "gross_cap": 6.0, "leverage": 10,
+  "name": "阿岚 · 1h 波段侦察",
+  "persona": "你是阿岚……（人设随便写；风险偏好也写在这里）",
+  "universe": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AAPL/USDT", "NVDA/USDT",
+               "SPX/USDT", "NDX100/USDT", "XAU/USDT"],
+  "tf": "1h",
+  "wake_interval": 14400,
+  "w": 0.5, "gross_cap": 3.0, "leverage": 2,
   "starting_equity": 1000.0,
-  "tools": ["get_candles", "get_indicators", "get_news", "..."]
+
+  "max_loss_per_trade_pct": 0.02,
+  "max_drawdown_halt": 0.30,
+  "stop_distance_min_pct": 0.004,
+  "stop_distance_max_pct": 0.5,
+  "cooldown_after_stop": 14400,
+  "default_exit_plan": {
+    "stop_loss":   {"type": "atr", "value": 2.0},
+    "take_profit": {"type": "atr", "value": 4.0}
+  },
+  "tools": ["get_candles", "get_indicators", "get_derivatives", "get_news", "..."]
 }
 ```
 
-`persona × tools 子集 × 参数` = 一个新策略。
+`persona × universe × tools 子集 × 风控参数` = 一个新策略。
+
+**风险偏好是策略画像的一部分，创建时就写定**（§9.4）。下面这些字段**全部可选、平铺在顶层**，
+没写的回落 `Config` 全局默认，所以老配置不用改：
+
+| 字段 | 管什么 |
+|---|---|
+| `max_loss_per_trade_pct` | 单笔最大亏损（占起始权益），"不能亏太多"的那层兜底 |
+| `max_drawdown_halt` | 账户累计回撤熔断线，破了只许减仓 |
+| `stop_distance_min_pct` / `stop_distance_max_pct` | 止损距离的允许区间：太近是噪声，太远形同虚设 |
+| `cooldown_after_stop` | 止损后同方向的冷却时长，防报复性交易 |
+| `default_exit_plan` | 默认退路：LLM 省略 `exit_plan` 时框架替它套上 |
+
+`AgentSpec.risk_cfg()` 把本策略的画像盖到全局配置上，下游（⑤ 校验、止损扫描、watchdog、
+提示词渲染）只认这一份 cfg。**同一个人设写"激进"还是"保守"，落在代码里就是这几个数字的差别**
+—— 全局一份值套在所有策略上，等于没有策略画像。
+
+`leverage` 仍然是表达风险偏好的主力旋钮之一，而且它和 `w` 是耦合的 ——
+两者一起决定"满仓时止损最宽能放到几%"：
+
+```
+满仓（ratio=1）允许的最大止损% = max_loss_per_trade_pct × 权益 ÷ (w × 权益 × leverage)
+```
+
+按 `w=0.5` / 权益 1000 / 单笔上限 2% 算：`leverage=2` → 止损最宽 2.0%，正好装得下
+1h 波段的 2×ATR 止损（实测 BTC 1.1%、SOL 2.0%、XRP 2.5%）；`leverage=10` → 上限被压到
+0.4%，那不是波段止损而是噪声止损，每条 1h bar 都能打掉它。
+换句话说**杠杆填错，止损宽度就被结构性锁死**，persona 里写"退路要宽"也没用。
+
+同理 `gross_cap` 要跟着杠杆标定：它限制 `Σ|名义| ÷ 权益`，而单笔名义上限是
+`w × 权益 × leverage` —— 杠杆降下来后 `gross_cap` 不跟着降，这个组合层闸门就永远不会触发。
+
+**品种池不限加密。** Bitget 的 `USDT-FUTURES` 实测有 804 个合约，其中就包含美股
+（`AAPLUSDT` / `NVDAUSDT` / `TSLAUSDT`…）、指数（`SPXUSDT` / `NDX100USDT` / `HSIUSDT`）、
+贵金属（`XAUUSDT` / `XAGUSDT`）与外汇（`EURUSDUSDT` / `GBPUSDUSDT`）——
+**不需要额外的行情源**，只需要符号映射：`candles.bitget_symbol()` 管交易口径，
+`data._info_symbol()` 管信息层（Yahoo）口径。池外的品种在 ⑤ 被硬拦，提示词里写着不算数。
 
 ### 6.2 数据层（info-feeds）
 
@@ -387,6 +438,20 @@ python -m info_feeds.collector --once     # 只跑一轮（冒烟用）
 盯哪些标的 / 主题见 `collector/config.py`
 （`CCB_WATCHLIST` / `CCB_PREDICTION_TOPICS` / `CCB_MACRO_SERIES` / `CCB_NEWS_LOOKBACK_DAYS`）。
 
+**采集清单从策略派生，不手工维护。** `WATCHLIST` 不设时取各 `agents/*.json` 里 `universe`
+的并集，并翻成信息层口径（`watchlist_from_agents()`，`AAPL/USDT → AAPL`、`SPX/USDT → ^GSPC`）。
+理由很直接：手工清单意味着"给 Agent 加了标的，却忘了让采集器去采它"，后果是那次
+`get_news` 查回空 —— 而 LLM 不会知道是漏采，只会读成"这个标的最近很安静"。
+**加标的只改一处，写入与读取两侧的口径由 `_INFO_ALIASES` 保证一致**
+（`data.py` 有一份逐字相同的副本，改一边就要改另一边）。
+
+**新鲜度闸门：把"停摆"和"平静"分开。** 采集侧一直在写 `source_health`，
+决策侧现在会读它：某个读工具依赖的源全部超过 `Config.info_stale_seconds`（默认 6h）
+没成功过，返回的就不再是"没有新闻"，而是"**数据源停摆**"；表若压根没有采集源
+（如 `market_events` 目前还没有），则如实说"**尚未接入采集**"。
+`news_items` 查回空可以是世界很安静，也可以是采集进程死了三天 ——
+只看表本身这两件事长得一模一样，而 LLM 一定会选那个更舒服的解释。
+
 ### 6.3 测试
 
 ```bash
@@ -398,7 +463,7 @@ python -m pytest tests -q
 |---|---|
 | `test_s1_ledger.py` | 撮合、费用、滑点、权益口径 |
 | `test_s2_watchdog.py` | 止损/止盈/移动止损被自动执行，**全程不涉及 LLM** |
-| `test_s3_tools.py` | 返回上限、失败哨兵、防前视、快照落库 |
+| `test_s3_tools.py` | 返回上限、失败哨兵、防前视、快照落库、**信息源的停摆/平静之分** |
 | `test_s4_loop.py` | 七步 loop 跑通、提案被拒的几种情形、指令出口 |
 | `test_s5_memory.py` | 三条记忆路径、反思闸门、防自我强化 |
 | `test_s6_risk_signals.py` | 三档风控兜底 + 指令落库/覆盖语义 |
@@ -460,11 +525,14 @@ ccb-trade/
 `ccb-sub-agents/harness/config.py`（全部魔术数字集中于此，代码里不许出现裸常量）：
 
 ```python
-cooldown_after_stop      = 1800     # 止损后冷却秒数
+# 下面这一节里，除"强平阈值"外都是**可被 agents/*.json 按策略覆盖**的默认值 ——
+# 风险偏好是策略画像的一部分，全局值只是"没写时的兜底"（AgentSpec.risk_cfg）。
+cooldown_after_stop      = 14400    # 止损后冷却秒数（= 一个唤醒周期）
+stop_distance_min_pct    = 0.0      # 止损距离下限，防"止损紧到只是噪声"（0 = 不限）
 stop_distance_max_pct    = 0.5      # 止损距离上限，防"名义上设了但形同虚设"
 max_loss_per_trade_pct   = 0.02     # ★ 单笔最多亏权益的 2%
 max_drawdown_halt        = 0.30     # ★ 累计回撤 30% -> 只许减仓
-maintenance_margin_rate  = 0.005    # 强平阈值（按名义算）
+maintenance_margin_rate  = 0.005    # 强平阈值（按名义算）；交易所口径，不开放覆盖
 scheduler_interval       = 10       # Loop 1
 watchdog_interval        = 60       # Loop 2
 max_concurrency          = 8        # LLM 限速
